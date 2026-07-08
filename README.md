@@ -47,10 +47,25 @@ It reads real signals from the log (commits, compile checks, patch writes, error
 results, retry loops) and is told to trust the agent's own narration over the
 heuristics, so the verdict is honest rather than a guess from raw counts.
 
-Model backends, tried in order: `OPENAI_API_KEY` (OpenAI Chat Completions), then
-the `codex` CLI you already have (uses your ChatGPT plan). Results cache to
-`~/.claude/pace-session-insights.json`, so each session is summarised once.
-Use `--dry-run` to see exactly what would be sent to the model before enabling it.
+Backends: the default is the no-key `codex` CLI (uses your ChatGPT plan, no
+metered cost); set `PACE_INSIGHT_BACKEND=openai` (with `OPENAI_API_KEY`) to use
+the metered API instead. Results cache to `~/.claude/pace-session-insights.json`,
+so each session is summarised once. Use `--dry-run` to see exactly what would be
+sent to the model before enabling it.
+
+### Pre-summarising in the background
+
+So the Sessions tab is already populated when you open it, run a background pass
+that summarises new substantial sessions on a schedule:
+
+```sh
+python3 scripts/session-insight.py --batch 6 --days 3   # summarise up to 6 recent uncached sessions
+```
+
+`scripts/com.pace.session-insight.plist` is a launchd template that runs this
+every 20 minutes. Edit the paths, copy it to `~/Library/LaunchAgents/`, and
+`launchctl load` it. The batch skips tiny sub-agent runs and anything already
+cached, and persists after each session so a slow run is resumable.
 
 ### Which backend, and what it costs
 

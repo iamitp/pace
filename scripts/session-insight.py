@@ -41,9 +41,14 @@ WASTE_MARKERS = ("error", "failed", "traceback", "exception", "not found",
                  "no such file", "command not found", "exit code 1", "denied")
 
 SCHEMA_HINT = {
-    "one_line": "8-12 word plain summary of what this session did",
-    "worked_on": "one sentence: the concrete task",
-    "produced": "one sentence: what actually resulted (files, commits, answers) or 'nothing shipped'",
+    "one_line": ("8-12 words naming the real subject of the session in plain "
+                 "English a non-technical person would recognise (the app, the "
+                 "document, the errand, the person). Name the actual thing, e.g. "
+                 "'Getting App Store downloads for Peeku' or 'Sorting out the LG "
+                 "washtower installation'. Never lead with tool names, file paths, "
+                 "or jargon like 'refactor', 'CLI', 'endpoint'."),
+    "worked_on": "one sentence: the concrete task in plain terms",
+    "produced": "one sentence: what actually resulted (files, commits, answers, a sent message) or 'nothing shipped'",
     "wasted": "one sentence: tokens spent with no payoff (loops, failed retries) or 'no obvious waste'",
     "useful_percent": "integer 0-100, share of the work that moved toward the goal",
 }
@@ -243,13 +248,87 @@ def save_cache(cache):
     os.replace(tmp, CACHE)
 
 
+def run_model(prompt):
+    # Default to the no-key codex CLI (spends ChatGPT plan quota, no metered
+    # cost). Opt into the metered API with PACE_INSIGHT_BACKEND=openai.
+    if os.environ.get("PACE_INSIGHT_BACKEND") == "openai":
+        return call_openai(prompt) or call_codex(prompt)
+    return call_codex(prompt) or call_openai(prompt)
+
+
+def summarise_one(path):
+    """Extract, summarise, and return the enriched insight dict (or None)."""
+    data = extract(path)
+    insight = parse_json(run_model(build_prompt(data)))
+    if insight is None:
+        return None
+    insight["session_id"] = data["session_id"]
+    insight["cwd"] = data["cwd"]
+    insight["tokens"] = data["tokens"]
+    insight["signals"] = data["signals"]
+    return insight
+
+
+def substantial_sessions(days, min_lines):
+    """Recent rollouts worth summarising, newest first. Skips tiny sub-agent
+    runs (few lines) that carry no meaningful task."""
+    cutoff = time.time() - days * 86400
+    paths = [p for p in glob.glob(SESS_GLOB, recursive=True)
+             if os.path.getmtime(p) >= cutoff]
+    paths.sort(key=os.path.getmtime, reverse=True)
+    out = []
+    for p in paths:
+        try:
+            lines = 0
+            with open(p, errors="ignore") as fh:
+                for lines, _ in enumerate(fh, 1):
+                    if lines >= min_lines:
+                        break
+            if lines >= min_lines:
+                out.append(p)
+        except Exception:
+            continue
+    return out
+
+
+def run_batch(limit, days, min_lines):
+    """Pre-summarise up to `limit` recent substantial sessions not yet cached.
+    This is what the background launchd job calls so the Sessions tab is already
+    populated by the time you open it."""
+    cache = load_cache()
+    done = 0
+    for path in substantial_sessions(days, min_lines):
+        if done >= limit:
+            break
+        # Cheap uuid-from-filename check avoids re-reading cached sessions.
+        m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                      os.path.basename(path))
+        if m and m.group(0) in cache:
+            continue
+        insight = summarise_one(path)
+        if insight is None:
+            continue
+        cache[insight["session_id"]] = insight
+        save_cache(cache)  # persist after each so a slow batch is resumable
+        done += 1
+        print(f"summarised {insight['session_id'][:8]}: {insight.get('one_line','')}", file=sys.stderr)
+    print(f"batch done: {done} new insight(s)", file=sys.stderr)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Summarise a Codex session.")
     ap.add_argument("session", nargs="?", help="session id fragment or rollout path; default = latest")
     ap.add_argument("--dry-run", action="store_true", help="print the extracted transcript, skip the model")
     ap.add_argument("--no-cache", action="store_true", help="ignore any cached insight")
     ap.add_argument("--force", action="store_true", help="recompute even if cached")
+    ap.add_argument("--batch", type=int, metavar="N", help="pre-summarise up to N recent uncached sessions")
+    ap.add_argument("--days", type=int, default=3, help="how far back --batch looks (default 3)")
+    ap.add_argument("--min-lines", type=int, default=40, help="skip sessions shorter than this (default 40)")
     args = ap.parse_args()
+
+    if args.batch is not None:
+        return run_batch(args.batch, args.days, args.min_lines)
 
     path = resolve_path(args.session)
     if not path:
@@ -267,24 +346,13 @@ def main():
         print(json.dumps(cache[data["session_id"]], indent=2))
         return 0
 
-    prompt = build_prompt(data)
-    # Default to the no-key codex CLI (spends ChatGPT plan quota, no metered
-    # cost). Opt into the metered API with PACE_INSIGHT_BACKEND=openai.
-    if os.environ.get("PACE_INSIGHT_BACKEND") == "openai":
-        raw = call_openai(prompt) or call_codex(prompt)
-    else:
-        raw = call_codex(prompt) or call_openai(prompt)
-    insight = parse_json(raw)
+    insight = summarise_one(path)
     if insight is None:
         print("no model backend produced a valid insight (set OPENAI_API_KEY or install codex)", file=sys.stderr)
         return 2
 
-    insight["session_id"] = data["session_id"]
-    insight["cwd"] = data["cwd"]
-    insight["tokens"] = data["tokens"]
-    insight["signals"] = data["signals"]
     if not args.no_cache:
-        cache[data["session_id"]] = insight
+        cache[insight["session_id"]] = insight
         save_cache(cache)
     print(json.dumps(insight, indent=2))
     return 0
