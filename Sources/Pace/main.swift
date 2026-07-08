@@ -83,6 +83,7 @@ struct PaceSnapshot {
     var codexResetsExpiries: [Date] = []
     var codexResetsDetail: [ResetCredit] = []
     var codexResetsHistory: [ResetCredit] = []
+    var codexWeeklyPools: [WeeklyPool] = []
 
     static func collect(refreshFeeds: Bool = false, includeSlowReadings: Bool = true, previous: PaceSnapshot? = nil, statusOnly: Bool = false) -> PaceSnapshot {
         if DistributionMode.isAppStore {
@@ -112,6 +113,7 @@ struct PaceSnapshot {
         snapshot.codexResetsExpiries = metadata.resetsExpiries
         snapshot.codexResetsDetail = metadata.resetsDetail
         snapshot.codexResetsHistory = metadata.resetsHistory
+        snapshot.codexWeeklyPools = metadata.weeklyPools
         if statusOnly {
             snapshot.burnRates = previous?.burnRates ?? []
             snapshot.sessions = previous?.sessions ?? []
@@ -158,6 +160,8 @@ struct PaceSnapshot {
         lines.append("codex_resets_detail=\(resetDetail.isEmpty ? "unknown" : resetDetail)")
         let resetHistory = codexResetsHistory.map { "\($0.label)|status=\($0.status)|resolved=\($0.resolvedAt.map(DateFormatting.dumpString) ?? "unknown")|expires=\(DateFormatting.dumpString($0.expiresAt))" }.joined(separator: ",")
         lines.append("codex_resets_history=\(resetHistory.isEmpty ? "none" : resetHistory)")
+        let poolText = codexWeeklyPools.map { "\($0.name)=\($0.usedPercent)%used/resets=\($0.resetsAt.map(DateFormatting.dumpString) ?? "?")" }.joined(separator: ",")
+        lines.append("codex_weekly_pools=\(poolText.isEmpty ? "none" : poolText)")
         for burnRate in burnRates {
             lines.append("pace \(burnRate.engine): \(burnRate.tokensText) / \(burnRate.windowDurationText) = \(burnRate.tokensPerMinuteText) quota_pace=\(burnRate.quotaPaceText) cap=\(burnRate.capEstimateText) basis=\"\(burnRate.evidenceText)\" freshness=\(burnRate.freshness)")
         }
@@ -362,14 +366,8 @@ enum SessionInsightStore {
     // The Python summariser (scripts/session-insight.py) caches results in this
     // file, keyed by the session's internal UUID.
     static let cachePath = homeURL.appendingPathComponent(".claude/pace-session-insights.json")
-    // Where the app shells out to for an on-demand summary. Override with
-    // PACE_INSIGHT_SCRIPT to point at your clone's scripts/session-insight.py.
-    static var scriptPath: URL {
-        if let override = ProcessInfo.processInfo.environment["PACE_INSIGHT_SCRIPT"], !override.isEmpty {
-            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
-        }
-        return homeURL.appendingPathComponent(".claude/session-insight.py")
-    }
+    // Where the app shells out to for an on-demand summary.
+    static let scriptPath = homeURL.appendingPathComponent(".claude/session-insight.py")
 
     private static let uuidRegex = try? NSRegularExpression(
         pattern: "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -613,6 +611,13 @@ enum QuotaReader {
     }
 }
 
+struct WeeklyPool: Identifiable {
+    let name: String
+    let usedPercent: Int
+    let resetsAt: Date?
+    var id: String { name }
+}
+
 enum CodexUsageMetadataReader {
     struct Metadata {
         let resetsAvailable: Int?
@@ -620,6 +625,7 @@ enum CodexUsageMetadataReader {
         let resetsExpiries: [Date]
         let resetsDetail: [ResetCredit]
         let resetsHistory: [ResetCredit]
+        let weeklyPools: [WeeklyPool]
     }
 
     static func read() -> Metadata {
@@ -628,8 +634,15 @@ enum CodexUsageMetadataReader {
             let data = try? Data(contentsOf: path),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            return Metadata(resetsAvailable: nil, resetsExpireAt: nil, resetsExpiries: [], resetsDetail: [], resetsHistory: [])
+            return Metadata(resetsAvailable: nil, resetsExpireAt: nil, resetsExpiries: [], resetsDetail: [], resetsHistory: [], weeklyPools: [])
         }
+        let weeklyPools = ((object["weekly_pools"] as? [Any]) ?? [])
+            .compactMap { value -> WeeklyPool? in
+                guard let o = value as? [String: Any] else { return nil }
+                let name = (o["name"] as? String) ?? "Codex"
+                let used = optionalInt(o["used_percent"]) ?? 0
+                return WeeklyPool(name: name, usedPercent: used, resetsAt: DateParsers.any(o["resets_at"]))
+            }
         let expiries = ((object["resets_expiries"] as? [Any]) ?? [])
             .compactMap { DateParsers.any($0) }
             .sorted()
@@ -684,7 +697,8 @@ enum CodexUsageMetadataReader {
             ?? expiries.first,
             resetsExpiries: expiries,
             resetsDetail: detail,
-            resetsHistory: history
+            resetsHistory: history,
+            weeklyPools: weeklyPools
         )
     }
 
@@ -1837,6 +1851,7 @@ struct PacePanelView: View {
         VStack(alignment: .leading, spacing: 10) {
             section("Usage") {
                 quotaList
+                extraWeeklyPoolRows
                 if store.snapshot.codexResetsAvailable != nil {
                     bankedResetRow
                 }
@@ -1870,7 +1885,7 @@ struct PacePanelView: View {
         let burnRates = store.snapshot.burnRates.sorted(by: burnSort)
         let active = burnRates.filter { $0.activeSessions > 0 || $0.tokensPerMinute > 0 }
         if !active.isEmpty {
-            section("Burn \u{00B7} last 15m") {
+            section("Burn · last 15m") {
                 VStack(spacing: 7) {
                     ForEach(active) { burnRate in
                         burnSummaryRow(burnRate)
@@ -1953,6 +1968,61 @@ struct PacePanelView: View {
                 quotaRow(quota)
             }
         }
+    }
+
+    // The account can hold more than one weekly pool. The binding (most-used) one
+    // is already shown above as the Codex week quota; surface the others here so
+    // Pace reconciles with the Codex app, which sometimes headlines a fresher
+    // pool (e.g. GPT-5.3-Codex-Spark) and reads more optimistic than reality.
+    @ViewBuilder
+    private var extraWeeklyPoolRows: some View {
+        let pools = store.snapshot.codexWeeklyPools
+        if pools.count > 1 {
+            let binding = pools.max(by: { $0.usedPercent < $1.usedPercent })
+            let others = pools.filter { $0.name != binding?.name }
+            ForEach(others) { pool in
+                weeklyPoolRow(pool)
+            }
+        }
+    }
+
+    private func weeklyPoolRow(_ pool: WeeklyPool) -> some View {
+        let left = max(0, 100 - pool.usedPercent)
+        let detail: String
+        if let reset = pool.resetsAt {
+            let f = DateFormatter(); f.dateFormat = "d MMM HH:mm"
+            detail = "\(pool.usedPercent)% used · resets \(f.string(from: reset))"
+        } else {
+            detail = "\(pool.usedPercent)% used"
+        }
+        return HStack(spacing: 10) {
+            Image(systemName: "calendar.badge.clock")
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 22, height: 22)
+                .foregroundStyle(PaceTheme.muted)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(poolDisplayName(pool.name)) week")
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(PaceTheme.muted)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Text("\(left)% left")
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                .foregroundStyle(PaceTheme.muted)
+        }
+        .padding(10)
+        .background(cardFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
+    }
+
+    private func poolDisplayName(_ name: String) -> String {
+        // Trim the verbose model label to something readable in a menu row.
+        if name.lowercased().contains("spark") { return "Codex-Spark" }
+        return name
     }
 
     @ViewBuilder

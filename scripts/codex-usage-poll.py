@@ -94,12 +94,37 @@ def live_rate_limits():
     secondary = _window_from_live(rate.get("secondary_window"))
     if primary is None and secondary is None:
         return None
+    # The account can carry more than one weekly pool (e.g. a separate
+    # GPT-5.3-Codex-Spark limit). The Codex app sometimes headlines a different
+    # pool than the main one, so capture them all and let Pace show the binding
+    # (most-used) weekly plus any others, so the two surfaces reconcile.
+    pools = []
+    main_sec = _window_from_live(rate.get("secondary_window"))
+    if main_sec:
+        main_sec = dict(main_sec, name="Codex")
+        pools.append(main_sec)
+    for extra in payload.get("additional_rate_limits") or []:
+        if not isinstance(extra, dict):
+            continue
+        name = extra.get("limit_name") or extra.get("metered_feature") or "Codex"
+        sub = (extra.get("rate_limit") or {})
+        w = _window_from_live(sub.get("secondary_window")) if isinstance(sub, dict) else None
+        if w:
+            pools.append(dict(w, name=str(name)))
+    def used_of(p):
+        try:
+            return float(p.get("used_percent") or 0)
+        except Exception:
+            return 0.0
+    # Binding weekly = the pool closest to its cap; that is the one that stops you.
+    binding = max(pools, key=used_of) if pools else secondary
     return {
         "plan_type": payload.get("plan_type"),
         "email": payload.get("email"),
         "account_id": payload.get("account_id"),
         "primary": primary,
-        "secondary": secondary,
+        "secondary": binding,
+        "weekly_pools": pools,
     }
 
 
@@ -328,6 +353,7 @@ def main():
             "account_id": live.get("account_id"),
             "primary": live.get("primary"),
             "secondary": live.get("secondary"),
+            "weekly_pools": live.get("weekly_pools") or [],
         }
     else:
         ts, rl = freshest_rate_limits()
