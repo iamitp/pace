@@ -52,6 +52,23 @@ the `codex` CLI you already have (uses your ChatGPT plan). Results cache to
 `~/.claude/pace-session-insights.json`, so each session is summarised once.
 Use `--dry-run` to see exactly what would be sent to the model before enabling it.
 
+### Which backend, and what it costs
+
+A session is small to summarise: about 700 input tokens and 150 output tokens,
+because Pace sends a trimmed transcript, not the raw log. Set `PACE_INSIGHT_MODEL`
+to pick the model (default `gpt-5-mini`).
+
+| Backend | Cost | Notes |
+| --- | --- | --- |
+| `codex` CLI | no API charge | Uses your ChatGPT plan, but spends the same rate-limit quota Pace is watching, and is slower (a full agent turn). Fine for the odd on-demand session. |
+| `gpt-5-nano` | ~$0.0001 / session | ~10,000 sessions per dollar. Near-free; good enough for one-line summaries. |
+| `gpt-5-mini` | ~$0.0005 / session | ~2,000 sessions per dollar. The default; sharper useful-vs-wasted calls. |
+
+At roughly 20 substantive sessions a day, `gpt-5-mini` runs about **$0.28 a
+month**. Summarising *every* session including sub-agent runs is still only about
+**$1.40 a month**. Caching means each session is billed once, however often you
+look at it.
+
 ## How it works
 
 Everything runs locally against sources you already have:
