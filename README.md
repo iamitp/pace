@@ -1,20 +1,17 @@
 # Pace
 
-**OpenAI deletes your Codex reset-credit history the moment a credit is used or expires. Pace keeps a local ledger of it.**
+**A macOS menu bar app that turns your Claude Code and Codex usage into something you can actually read.**
 
-Pace is a macOS menu bar app that shows your live Claude Code and OpenAI Codex
-rate-limit usage in one place: the 5-hour and weekly windows, how fast you are
-burning them, and whether you are on pace to hit a cap before it resets.
+Pace shows your live Claude Code and OpenAI Codex rate-limit usage in one place:
+the 5-hour and weekly windows, how fast you are burning them, and whether you are
+on pace to hit a cap before it resets.
 
-It also does one thing no other tool does. Codex hands out "rate limit reset
-credits" (banked resets you can spend to clear a window). The official
-`rate-limit-reset-credits` endpoint drops a credit from its response the instant
-you redeem it or it lapses, so there is no way to see which credits you used,
-which you let expire, or when. Pace polls that endpoint on a schedule and keeps
-a persistent local ledger, so your banked resets show a **Past resets** history
-with used / expired badges alongside the ones you still hold.
-
-The transparency gap is a known one: [openai/codex#29618](https://github.com/openai/codex/issues/29618).
+It also keeps a local history of your Codex "rate limit reset credits" (the banked
+resets you can spend to clear a window). The credits endpoint lists only the ones
+currently available, so once you redeem a credit or it expires it drops off the
+list. Pace polls on a schedule and remembers them, so your banked resets show a
+**Past resets** history with used / expired badges alongside the ones you still
+hold.
 
 ## Screenshots
 
