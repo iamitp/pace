@@ -7,10 +7,13 @@ script distils one session into a compact summary, has a model read it, and
 returns structured JSON describing what was worked on, what it produced, and how
 much of the spend was useful versus wasted.
 
-Model backends, tried in order:
-  1. OPENAI_API_KEY set  -> OpenAI Chat Completions (default model gpt-5-mini).
-  2. `codex` on PATH     -> `codex exec` using the ChatGPT plan you already have.
-  3. --dry-run           -> skip the model, print the extracted transcript only.
+Model backends. The default is the `codex` CLI, so there is no API key to set up
+and no metered cost: it spends the ChatGPT plan quota you already pay for. Set
+PACE_INSIGHT_BACKEND=openai (with OPENAI_API_KEY) if you would rather use the
+metered API.
+  1. codex CLI (default) -> `codex exec` using the ChatGPT plan you already have.
+  2. OPENAI_API_KEY       -> OpenAI Chat Completions (opt in via backend=openai).
+  3. --dry-run            -> skip the model, print the extracted transcript only.
 
 Results cache to ~/.claude/pace-session-insights.json keyed by session id, so a
 session is summarised once and re-read for free. Everything stays local; the
@@ -265,7 +268,12 @@ def main():
         return 0
 
     prompt = build_prompt(data)
-    raw = call_openai(prompt) or call_codex(prompt)
+    # Default to the no-key codex CLI (spends ChatGPT plan quota, no metered
+    # cost). Opt into the metered API with PACE_INSIGHT_BACKEND=openai.
+    if os.environ.get("PACE_INSIGHT_BACKEND") == "openai":
+        raw = call_openai(prompt) or call_codex(prompt)
+    else:
+        raw = call_codex(prompt) or call_openai(prompt)
     insight = parse_json(raw)
     if insight is None:
         print("no model backend produced a valid insight (set OPENAI_API_KEY or install codex)", file=sys.stderr)

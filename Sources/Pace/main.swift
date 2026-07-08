@@ -161,6 +161,13 @@ struct PaceSnapshot {
         for burnRate in burnRates {
             lines.append("pace \(burnRate.engine): \(burnRate.tokensText) / \(burnRate.windowDurationText) = \(burnRate.tokensPerMinuteText) quota_pace=\(burnRate.quotaPaceText) cap=\(burnRate.capEstimateText) basis=\"\(burnRate.evidenceText)\" freshness=\(burnRate.freshness)")
         }
+        let insightMap = SessionInsightStore.load()
+        lines.append("session_insights_cached=\(insightMap.count)")
+        for session in sessions {
+            if let uuid = SessionInsightStore.uuid(forSessionID: session.id), let ins = insightMap[uuid] {
+                lines.append("insight \(uuid.prefix(8)): useful=\(ins.usefulPercent.map(String.init) ?? "?")% \"\(ins.oneLine)\"")
+            }
+        }
         let graphBuckets = burnRates.map { $0.points.count }.max() ?? 0
         let graphActive = burnRates.reduce(0) { $0 + $1.activeSessions }
         lines.append("pace_graph=buckets=\(graphBuckets) active_sessions=\(graphActive) render_refresh=\(Int(RefreshCadence.renderRefresh * 1000))ms live_ingest=\(Int(RefreshCadence.livePaceRefresh * 1000))ms full_refresh=\(Int(RefreshCadence.fullRefresh))s primary_rate=\"\(burnRates.sorted { $0.tokensPerMinute > $1.tokensPerMinute }.first?.tokensPerMinuteText ?? "idle")\"")
@@ -341,6 +348,67 @@ struct SessionReading: Identifiable {
     let tokens: Int
     let tokenBasis: String
     let lastActivity: Date
+}
+
+struct SessionInsight {
+    let oneLine: String
+    let workedOn: String
+    let produced: String
+    let wasted: String
+    let usefulPercent: Int?
+}
+
+enum SessionInsightStore {
+    // The Python summariser (scripts/session-insight.py) caches results in this
+    // file, keyed by the session's internal UUID.
+    static let cachePath = homeURL.appendingPathComponent(".claude/pace-session-insights.json")
+    // Where the app shells out to for an on-demand summary. Override with
+    // PACE_INSIGHT_SCRIPT to point at your clone's scripts/session-insight.py.
+    static var scriptPath: URL {
+        if let override = ProcessInfo.processInfo.environment["PACE_INSIGHT_SCRIPT"], !override.isEmpty {
+            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
+        }
+        return homeURL.appendingPathComponent(".claude/session-insight.py")
+    }
+
+    private static let uuidRegex = try? NSRegularExpression(
+        pattern: "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+    // A rollout path is …/rollout-<timestamp>-<uuid>.jsonl; the summariser keys
+    // its cache by that uuid, so pull it straight from the filename.
+    static func uuid(forSessionID id: String) -> String? {
+        guard let regex = uuidRegex else { return nil }
+        let range = NSRange(id.startIndex..., in: id)
+        var last: String?
+        regex.enumerateMatches(in: id, range: range) { match, _, _ in
+            if let m = match, let r = Range(m.range, in: id) { last = String(id[r]) }
+        }
+        return last
+    }
+
+    static func load() -> [String: SessionInsight] {
+        guard
+            let data = try? Data(contentsOf: cachePath),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return [:] }
+        var out: [String: SessionInsight] = [:]
+        for (key, value) in object {
+            guard let entry = value as? [String: Any] else { continue }
+            func str(_ k: String) -> String { (entry[k] as? String) ?? "" }
+            var pct: Int? = nil
+            if let n = entry["useful_percent"] as? Int { pct = n }
+            else if let d = entry["useful_percent"] as? Double { pct = Int(d) }
+            else if let s = entry["useful_percent"] as? String { pct = Int(s) }
+            out[key] = SessionInsight(
+                oneLine: str("one_line"),
+                workedOn: str("worked_on"),
+                produced: str("produced"),
+                wasted: str("wasted"),
+                usefulPercent: pct
+            )
+        }
+        return out
+    }
 }
 
 struct PacePoint: Identifiable {
@@ -1101,9 +1169,6 @@ enum SystemReader {
 }
 
 enum TodoReader {
-    // Optional: point PACE_TODO_FILE at a markdown file whose "## " headings are
-    // your tasks (append [active] or [deferred:...] to a heading to tag it).
-    // Absent by default, in which case the todo card stays empty.
     static func read() -> TodoReading {
         guard let override = ProcessInfo.processInfo.environment["PACE_TODO_FILE"], !override.isEmpty else {
             return .empty
@@ -1422,7 +1487,43 @@ enum AlertBuilder {
 @MainActor
 final class PaceStore: ObservableObject {
     @Published var snapshot = PaceSnapshot.collect(statusOnly: LocalMode.isCodexOnly)
+    @Published var insights: [String: SessionInsight] = SessionInsightStore.load()
+    @Published var summarising: Set<String> = []
     private var isRefreshing = false
+
+    func insight(for session: SessionReading) -> SessionInsight? {
+        guard let uuid = SessionInsightStore.uuid(forSessionID: session.id) else { return nil }
+        return insights[uuid]
+    }
+
+    func isSummarising(_ session: SessionReading) -> Bool {
+        guard let uuid = SessionInsightStore.uuid(forSessionID: session.id) else { return false }
+        return summarising.contains(uuid)
+    }
+
+    // Shell out to the summariser for one session, then reload the cache. The
+    // script defaults to the no-key codex CLI backend (spends ChatGPT plan quota,
+    // no metered cost), so this can be slow; the UI shows a running state.
+    func summarise(_ session: SessionReading) {
+        guard let uuid = SessionInsightStore.uuid(forSessionID: session.id),
+              !summarising.contains(uuid) else { return }
+        summarising.insert(uuid)
+        let path = session.id
+        Task.detached {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["python3", SessionInsightStore.scriptPath.path, path]
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            try? process.run()
+            process.waitUntilExit()
+            let reloaded = SessionInsightStore.load()
+            await MainActor.run {
+                self.insights = reloaded
+                self.summarising.remove(uuid)
+            }
+        }
+    }
 
     func refresh(refreshFeeds: Bool = false, includeSlowReadings: Bool = true, statusOnly: Bool = false) {
         guard !isRefreshing else { return }
@@ -1430,8 +1531,10 @@ final class PaceStore: ObservableObject {
         let previous = snapshot
         Task.detached {
             let next = PaceSnapshot.collect(refreshFeeds: refreshFeeds, includeSlowReadings: includeSlowReadings, previous: previous, statusOnly: statusOnly)
+            let reloadedInsights = SessionInsightStore.load()
             await MainActor.run {
                 self.snapshot = next
+                self.insights = reloadedInsights
                 self.isRefreshing = false
             }
         }
@@ -1652,7 +1755,7 @@ enum StatusBarText {
 
 struct PacePanelView: View {
     @ObservedObject var store: PaceStore
-    @State private var tab = "Now"
+    @State private var tab = ProcessInfo.processInfo.environment["PACE_DEBUG_TAB"] ?? "Now"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2226,32 +2329,102 @@ struct PacePanelView: View {
     }
 
     private func sessionRow(_ session: SessionReading) -> some View {
-        HStack(spacing: 10) {
-            Text(session.source.prefix(2).uppercased())
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(sourceAccent(session.source))
-                .frame(width: 34, height: 24)
-                .background(sourceAccent(session.source).opacity(0.18), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(session.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(1)
-                Text(sessionDetail(session))
-                    .font(.caption2)
-                    .foregroundStyle(PaceTheme.muted)
+        let insight = store.insight(for: session)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Text(session.source.prefix(2).uppercased())
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(sourceAccent(session.source))
+                    .frame(width: 34, height: 24)
+                    .background(sourceAccent(session.source).opacity(0.18), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(insight?.oneLine.isEmpty == false ? insight!.oneLine : session.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(2)
+                    Text(sessionDetail(session))
+                        .font(.caption2)
+                        .foregroundStyle(PaceTheme.muted)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(sessionTokenText(session))
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    Text(session.tokenBasis)
+                        .font(.caption2)
+                        .foregroundStyle(PaceTheme.muted)
+                }
             }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(sessionTokenText(session))
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                Text(session.tokenBasis)
-                    .font(.caption2)
-                    .foregroundStyle(PaceTheme.muted)
-            }
+            sessionInsightBlock(session, insight: insight)
         }
         .padding(10)
         .background(cardFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
+    }
+
+    @ViewBuilder
+    private func sessionInsightBlock(_ session: SessionReading, insight: SessionInsight?) -> some View {
+        if let insight = insight {
+            VStack(alignment: .leading, spacing: 4) {
+                if !insight.produced.isEmpty {
+                    insightLine(icon: "checkmark.seal", text: insight.produced, accent: PaceTheme.green)
+                }
+                if !insight.wasted.isEmpty && insight.wasted.lowercased() != "no obvious waste" {
+                    insightLine(icon: "exclamationmark.triangle", text: insight.wasted, accent: PaceTheme.amber)
+                }
+                if let pct = insight.usefulPercent {
+                    HStack(spacing: 6) {
+                        Text("Useful")
+                            .font(.caption2)
+                            .foregroundStyle(PaceTheme.muted)
+                        ProgressView(value: Double(max(0, min(100, pct))) / 100.0)
+                            .frame(maxWidth: 90)
+                            .tint(usefulAccent(pct))
+                        Text("\(pct)%")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundStyle(usefulAccent(pct))
+                    }
+                }
+            }
+            .padding(.leading, 44)
+        } else if store.isSummarising(session) {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Summarising…")
+                    .font(.caption2)
+                    .foregroundStyle(PaceTheme.muted)
+            }
+            .padding(.leading, 44)
+        } else if SessionInsightStore.uuid(forSessionID: session.id) != nil {
+            Button {
+                store.summarise(session)
+            } label: {
+                Label("Explain this session", systemImage: "sparkles")
+                    .font(.caption2)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(PaceTheme.blue)
+            .padding(.leading, 44)
+        }
+    }
+
+    private func insightLine(icon: String, text: String, accent: Color) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(accent)
+                .frame(width: 14)
+            Text(text)
+                .font(.caption2)
+                .foregroundStyle(PaceTheme.muted)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func usefulAccent(_ pct: Int) -> Color {
+        if pct >= 60 { return PaceTheme.green }
+        if pct >= 30 { return PaceTheme.amber }
+        return PaceTheme.coral
     }
 
     private func compactSessionRow(_ session: SessionReading) -> some View {
@@ -2548,6 +2721,7 @@ final class DebugWindowDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         self.window = window
         NSApp.activate(ignoringOtherApps: true)
+        store.refreshFull()
     }
 }
 
