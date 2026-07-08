@@ -19,10 +19,38 @@ hold.
 
 ## Features
 
+- **Session intelligence** — every usage tracker shows how many tokens you spent. Pace tells you what they *bought*. It reads the full transcript already sitting in your Codex session logs, has a model summarise it, and shows a plain-English line per session: what you worked on, what it produced, and how much of the spend was useful versus wheel-spinning on a failing build. See [Session intelligence](#session-intelligence) below.
 - **Claude Code + Codex in one dial** — 5-hour and weekly windows for both, colour-coded.
 - **Pace projection** — compares burn rate to elapsed time in the window and flags when you are running hot enough to hit the cap early.
-- **Banked-reset ledger** — available resets with per-credit grant and expiry dates, plus a Past resets history of used and expired credits that the API itself no longer reports.
+- **Banked-reset ledger** — available resets with per-credit grant and expiry dates, plus a Past resets history of used and expired credits that the live endpoint no longer lists.
 - **Live server truth** — reads the same `wham/usage` endpoint the Codex app uses, so the numbers match, and falls back to local session snapshots if the network blips.
+
+## Session intelligence
+
+Your Codex session logs under `~/.codex/sessions` are not just token counts. They
+hold the whole transcript: the task you gave, every tool call, every result.
+`scripts/session-insight.py` distils one session into a compact summary, has a
+model read it, and returns a structured retrospective:
+
+```
+$ python3 scripts/session-insight.py            # latest session
+{
+  "one_line": "Fixed card-suffix and payee normalisation across two commits.",
+  "worked_on": "Address six code-review findings in the CLI and library modules.",
+  "produced": "Committed fixes for suffix resolution and payee normalisation.",
+  "wasted": "Some wheel-spin: repeated retries and several error results.",
+  "useful_percent": 35
+}
+```
+
+It reads real signals from the log (commits, compile checks, patch writes, error
+results, retry loops) and is told to trust the agent's own narration over the
+heuristics, so the verdict is honest rather than a guess from raw counts.
+
+Model backends, tried in order: `OPENAI_API_KEY` (OpenAI Chat Completions), then
+the `codex` CLI you already have (uses your ChatGPT plan). Results cache to
+`~/.claude/pace-session-insights.json`, so each session is summarised once.
+Use `--dry-run` to see exactly what would be sent to the model before enabling it.
 
 ## How it works
 
