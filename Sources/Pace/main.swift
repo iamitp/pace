@@ -1835,15 +1835,15 @@ struct PacePanelView: View {
 
     private var nowView: some View {
         VStack(alignment: .leading, spacing: 10) {
-            livePaceGraph
-            activeSessionHighlights
-            sourceBanner
             section("Usage") {
                 quotaList
                 if store.snapshot.codexResetsAvailable != nil {
                     bankedResetRow
                 }
             }
+            burnStrip
+            activeSessionHighlights
+            sourceBanner
             section("Alerts") {
                 if store.snapshot.alerts.isEmpty {
                     row("Clear", detail: LocalMode.isCodexOnly ? "No active Codex alerts" : "No active Pace alerts", icon: "checkmark.circle", accent: PaceTheme.green)
@@ -1863,47 +1863,24 @@ struct PacePanelView: View {
         .padding(14)
     }
 
-    private var livePaceGraph: some View {
+    // The live burn, as a compact strip rather than a graph: the sparkline did
+    // not earn the vertical space it took at the top of the panel.
+    @ViewBuilder
+    private var burnStrip: some View {
         let burnRates = store.snapshot.burnRates.sorted(by: burnSort)
-        let activeCount = burnRates.reduce(0) { $0 + $1.activeSessions }
-        let topBurn = burnRates.first
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Burn Now")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(PaceTheme.muted)
-                        .textCase(.uppercase)
-                    Text("\(activeCount) active sessions · last 15m · updated \(relativeTime(store.snapshot.generatedAt))")
-                        .font(.caption2)
-                        .foregroundStyle(PaceTheme.muted)
+        let active = burnRates.filter { $0.activeSessions > 0 || $0.tokensPerMinute > 0 }
+        if !active.isEmpty {
+            section("Burn \u{00B7} last 15m") {
+                VStack(spacing: 7) {
+                    ForEach(active) { burnRate in
+                        burnSummaryRow(burnRate)
+                    }
                 }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(topBurn?.tokensPerMinuteText ?? "idle")
-                        .font(.system(size: 30, weight: .bold, design: .monospaced))
-                        .foregroundStyle(topBurn.map(burnAccent) ?? PaceTheme.muted)
-                        .minimumScaleFactor(0.72)
-                    Text(topBurn.map { "\($0.tokensText) / \($0.windowDurationText) · \($0.capEstimateText)" } ?? "0 tokens / 15m")
-                        .font(.caption2)
-                        .foregroundStyle(PaceTheme.muted)
-                }
-            }
-
-            TimelineView(.animation(minimumInterval: RefreshCadence.renderRefresh)) { timeline in
-                PaceGraphView(burnRates: burnRates, renderDate: timeline.date)
-            }
-            .frame(height: 132)
-
-            VStack(spacing: 7) {
-                ForEach(burnRates) { burnRate in
-                    burnSummaryRow(burnRate)
-                }
+                .padding(10)
+                .background(cardFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
             }
         }
-        .padding(12)
-        .background(cardFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
     }
 
     private func burnSummaryRow(_ burnRate: BurnReading) -> some View {
