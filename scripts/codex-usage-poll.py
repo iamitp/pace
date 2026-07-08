@@ -117,13 +117,14 @@ def live_rate_limits():
         except Exception:
             return 0.0
     # Binding weekly = the pool closest to its cap; that is the one that stops you.
-    binding = max(pools, key=used_of) if pools else secondary
+    # The Codex app shows the main weekly pool as "Weekly"; mirror that exactly.
+    _ = used_of  # (pools still captured for reference, not surfaced)
     return {
         "plan_type": payload.get("plan_type"),
         "email": payload.get("email"),
         "account_id": payload.get("account_id"),
         "primary": primary,
-        "secondary": binding,
+        "secondary": secondary,
         "weekly_pools": pools,
     }
 

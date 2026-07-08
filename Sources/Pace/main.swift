@@ -1851,7 +1851,6 @@ struct PacePanelView: View {
         VStack(alignment: .leading, spacing: 10) {
             section("Usage") {
                 quotaList
-                extraWeeklyPoolRows
                 if store.snapshot.codexResetsAvailable != nil {
                     bankedResetRow
                 }
