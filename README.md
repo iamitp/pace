@@ -42,7 +42,7 @@ Everything runs locally against sources you already have:
 Build from source (Swift 6, macOS 13+):
 
 ```sh
-git clone https://github.com/REPLACE_OWNER/pace.git
+git clone https://github.com/iamitp/pace.git
 cd pace
 swift build -c release
 ./script/build_and_run.sh   # builds Pace.app and launches it

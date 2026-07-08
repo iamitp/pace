@@ -3,3 +3,5 @@
 dist/
 *.xcuserstate
 private_keys/
+
+launch/
