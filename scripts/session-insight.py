@@ -42,12 +42,14 @@ WASTE_MARKERS = ("error", "failed", "traceback", "exception", "not found",
                  "no such file", "command not found", "exit code 1", "denied")
 
 SCHEMA_HINT = {
-    "one_line": ("8-12 words naming the real subject of the session in plain "
-                 "English a non-technical person would recognise (the app, the "
-                 "document, the errand, the person). Name the actual thing, e.g. "
-                 "'Getting App Store downloads for Peeku' or 'Sorting out the LG "
-                 "washtower installation'. Never lead with tool names, file paths, "
-                 "or jargon like 'refactor', 'CLI', 'endpoint'."),
+    "one_line": ("A short tag the way a busy person files it in their own notes: "
+                 "the subject or project FIRST, then a 2-4 word action, joined by "
+                 "' · '. Five or six words MAX. Examples of the exact style: "
+                 "'Peeku · App Store downloads', 'Fincom · card-suffix fixes', "
+                 "'LG washtower · installation', 'Pace · session insights'. "
+                 "Lead with the noun/subject, never a verb. NO gerunds ('Getting', "
+                 "'Checking', 'Sorting'), NO full sentences, NO tool names, file "
+                 "paths, or jargon ('refactor', 'CLI', 'endpoint')."),
     "worked_on": "one sentence: the concrete task in plain terms",
     "produced": "one sentence: what actually resulted (files, commits, answers, a sent message) or 'nothing shipped'",
     "wasted": "one sentence: tokens spent with no payoff (loops, failed retries) or 'no obvious waste'",

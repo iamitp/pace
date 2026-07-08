@@ -2384,7 +2384,7 @@ struct PacePanelView: View {
                     .frame(width: 34, height: 24)
                     .background(sourceAccent(session.source).opacity(0.18), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(insight?.oneLine.isEmpty == false ? insight!.oneLine : session.title)
+                    Text(sessionLabel(session, insight))
                         .font(.system(size: 13, weight: .semibold))
                         .lineLimit(2)
                     Text(sessionDetail(session))
@@ -2473,6 +2473,18 @@ struct PacePanelView: View {
         return PaceTheme.coral
     }
 
+    // What to show as the session's headline. Prefer the brain-style tag from the
+    // summariser; if it has not run yet, fall back to the project folder, never
+    // the raw prompt the user typed (which reads as noise in a list).
+    private func sessionLabel(_ session: SessionReading, _ insight: SessionInsight?) -> String {
+        if let tag = insight?.oneLine, !tag.isEmpty { return tag }
+        let workspace = session.workspace.trimmingCharacters(in: .whitespaces)
+        if !workspace.isEmpty, !["home", "workspace", "unknown"].contains(workspace.lowercased()) {
+            return workspace
+        }
+        return session.status == "running" ? "Working…" : "Codex session"
+    }
+
     private func compactSessionRow(_ session: SessionReading) -> some View {
         HStack(spacing: 10) {
             Image(systemName: session.status == "running" ? "waveform.path.ecg" : "checkmark.circle")
@@ -2480,7 +2492,7 @@ struct PacePanelView: View {
                 .foregroundStyle(sourceAccent(session.source))
                 .frame(width: 22, height: 22)
             VStack(alignment: .leading, spacing: 2) {
-                Text(session.title)
+                Text(sessionLabel(session, store.insight(for: session)))
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
                 Text(sessionDetail(session))
