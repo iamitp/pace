@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "source_kind": "review-sample",
+  "source_label": "Bundled review sample",
+  "generated_at": "2026-06-24T07:30:00Z",
+  "quotas": [
+    {
+      "engine": "Codex",
+      "window": "5h",
+      "used_percent": 34,
+      "resets_in_seconds": 9360,
+      "updated_age_seconds": 120,
+      "source": "sample"
+    },
+    {
+      "engine": "Claude",
+      "window": "5h",
+      "used_percent": 18,
+      "resets_in_seconds": 13680,
+      "updated_age_seconds": 240,
+      "source": "sample"
+    },
+    {
+      "engine": "Codex",
+      "window": "week",
+      "used_percent": 58,
+      "resets_in_seconds": 362880,
+      "updated_age_seconds": 180,
+      "source": "sample"
+    },
+    {
+      "engine": "Claude",
+      "window": "week",
+      "used_percent": 72,
+      "resets_in_seconds": 64800,
+      "updated_age_seconds": 300,
+      "source": "sample"
+    }
+  ],
+  "burn_rates": [
+    {
+      "engine": "Codex",
+      "tokens": 188000,
+      "tokens_per_minute": 12500,
+      "window_seconds": 900,
+      "quota_percent_per_minute": 0.4,
+      "remaining_percent": 66,
+      "active_sessions": 2,
+      "last_event_age_seconds": 45
+    },
+    {
+      "engine": "Claude",
+      "tokens": 42000,
+      "tokens_per_minute": 2800,
+      "window_seconds": 900,
+      "remaining_percent": 82,
+      "active_sessions": 1,
+      "last_event_age_seconds": 120
+    }
+  ],
+  "sessions": [
+    {
+      "id": "sample-1",
+      "source": "Codex",
+      "repo": "release-readiness",
+      "model": "gpt-5.5",
+      "status": "running",
+      "tokens": 1320000,
+      "last_activity_age_seconds": 180
+    },
+    {
+      "id": "sample-2",
+      "source": "Codex",
+      "repo": "snapshot-import",
+      "model": "gpt-5.5",
+      "status": "done",
+      "tokens": 428000,
+      "last_activity_age_seconds": 2400
+    },
+    {
+      "id": "sample-3",
+      "source": "Local",
+      "repo": "pace-ui",
+      "model": "review fixture",
+      "status": "done",
+      "tokens": 206000,
+      "last_activity_age_seconds": 7200
+    }
+  ],
+  "history": {
+    "sessions_24h": 7,
+    "tokens_24h": 2450000,
+    "sessions_7d": 32,
+    "tokens_7d": 10800000
+  },
+  "todos": {
+    "pending": 4,
+    "active": 1,
+    "deferred": 2
+  },
+  "sync": {
+    "enabled": true,
+    "peer_count": 2,
+    "latest_snapshot": "review-sample.json"
+  },
+  "system": {
+    "load": "sample",
+    "disk_free_gb": "hidden",
+    "power": "AC"
+  },
+  "alerts": [
+    "Review sample data"
+  ]
+}
