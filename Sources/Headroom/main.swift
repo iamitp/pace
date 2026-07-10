@@ -132,6 +132,20 @@ struct PaceSnapshot {
             snapshot.sessions = Array(recentSessions.prefix(10))
             snapshot.history = includeSlowReadings ? HistoryReader.history(from: recentSessions) : (previous?.history ?? HistoryReader.history(from: recentSessions))
         }
+        // The usage feed alone can't distinguish "meter shows 100%" from
+        // "server is refusing" — that verdict lives in the session rollouts.
+        // Attach the freshest serving evidence to the Codex 5h reading so the
+        // fumes state can render.
+        if let idx = snapshot.quotas.firstIndex(where: { $0.engine == "Codex" && $0.window == "5h" }) {
+            if let burn = snapshot.burnRates.first(where: { $0.engine == "Codex" }), burn.lastEventAt != nil {
+                snapshot.quotas[idx].lastServedAt = burn.lastEventAt
+                snapshot.quotas[idx].limitReached = burn.rateLimitReached
+            } else if statusOnly {
+                let signal = BurnRateReader.codexServingSignal()
+                snapshot.quotas[idx].lastServedAt = signal.lastServedAt
+                snapshot.quotas[idx].limitReached = signal.limitReached
+            }
+        }
         if LocalMode.isCodexOnly {
             snapshot.system = previous?.system ?? SystemReading.empty
             snapshot.todos = previous?.todos ?? TodoReading.empty
@@ -211,6 +225,8 @@ struct QuotaReading: Identifiable {
     let updatedAt: Date?
     var sourceReadingAt: Date? = nil
     var windowMinutes: Double? = nil
+    var lastServedAt: Date? = nil
+    var limitReached: Bool? = nil
 
     var remainingPercent: Double? {
         guard let usedPercent else { return nil }
@@ -291,6 +307,8 @@ struct QuotaReading: Identifiable {
     }
 
     var paceText: String {
+        if isOnFumes { return "on fumes · still serving" }
+        if limitReached == true, (remainingPercent ?? 100) <= 1 { return "capped" }
         guard (usedPercent ?? 0) >= 5 else { return "quiet" }
         guard let paceRatio else { return "" }
         if paceRatio < 0.85 { return "under pace" }
@@ -298,9 +316,21 @@ struct QuotaReading: Identifiable {
         return String(format: "%.1f× pace", paceRatio)
     }
 
-    enum PaceState { case unknown, good, hot, critical }
+    // The meter is a report, not a cutoff: Codex's 5h window is rolling and
+    // enforcement happens per request, so a session can keep being served at
+    // "0% left". The freshest in-session rate_limits block carries the server's
+    // actual verdict (rate_limit_reached_type). Fumes = meter exhausted, no
+    // enforcement flag, and requests landed within the last few minutes.
+    var isOnFumes: Bool {
+        guard window == "5h", let remaining = remainingPercent, remaining <= 1 else { return false }
+        guard limitReached != true, let lastServedAt else { return false }
+        return Date().timeIntervalSince(lastServedAt) < 180
+    }
+
+    enum PaceState { case unknown, good, hot, critical, fumes }
 
     var paceState: PaceState {
+        if isOnFumes { return .fumes }
         guard let remaining = remainingPercent, let used = usedPercent else { return .unknown }
         if remaining <= 5 {
             if let resetAt, resetAt.timeIntervalSince(Date()) < 1800 { return .hot }
@@ -443,6 +473,7 @@ struct BurnReading: Identifiable {
     let activeSessions: Int
     let lastEventAt: Date?
     let points: [PacePoint]
+    var rateLimitReached: Bool? = nil
 
     var tokensPerMinuteText: String {
         guard tokensPerMinute > 0 else { return "idle" }
@@ -1039,6 +1070,7 @@ enum BurnRateReader {
         let quotaUsedPercent: Double?
         let timestamp: Date
         let session: String
+        var rateLimitReached: Bool? = nil
     }
 
     private static let windowSeconds: TimeInterval = 15 * 60
@@ -1049,6 +1081,14 @@ enum BurnRateReader {
         return engines.map { engine in
             reading(engine: engine, events: events.filter { $0.engine == engine }, quotas: quotas)
         }
+    }
+
+    // Lightweight serving evidence for status-only refreshes, which skip the
+    // full burn read: when did a Codex request last land, and has the server
+    // flagged the limit as actually reached.
+    static func codexServingSignal() -> (lastServedAt: Date?, limitReached: Bool?) {
+        let events = readCodexEvents(scope: .live).sorted { $0.timestamp < $1.timestamp }
+        return (events.last?.timestamp, events.reversed().compactMap(\.rateLimitReached).first)
     }
 
     private static func reading(engine: String, events: [BurnEvent], quotas: [QuotaReading]) -> BurnReading {
@@ -1064,6 +1104,7 @@ enum BurnRateReader {
         let quotaPace = quotaPercentPerMinute(from: recent)
         let remaining = quotas.first { $0.engine == engine && $0.window == "5h" }?.remainingPercent
         let points = pacePoints(from: recent, now: now)
+        let limitFlag = recent.reversed().compactMap(\.rateLimitReached).first
         return BurnReading(
             engine: engine,
             tokens: tokens,
@@ -1073,7 +1114,8 @@ enum BurnRateReader {
             remainingPercent: remaining,
             activeSessions: activeSessions,
             lastEventAt: lastEventAt,
-            points: points
+            points: points,
+            rateLimitReached: limitFlag
         )
     }
 
@@ -1149,12 +1191,17 @@ enum BurnRateReader {
                 let tokens = int(lastUsage?["total_tokens"] ?? totalUsage?["total_tokens"])
                 let rateLimits = payload["rate_limits"] as? [String: Any]
                 let primary = rateLimits?["primary"] as? [String: Any]
+                let reached: Bool? = rateLimits.map { limits in
+                    guard let value = limits["rate_limit_reached_type"], !(value is NSNull) else { return false }
+                    return true
+                }
                 return BurnEvent(
                     engine: "Codex",
                     tokens: tokens,
                     quotaUsedPercent: number(primary?["used_percent"]),
                     timestamp: timestamp,
-                    session: file.path
+                    session: file.path,
+                    rateLimitReached: reached
                 )
             }
         }
@@ -2049,6 +2096,7 @@ enum StatusBarText {
             case none      // healthy window: just the percentage
             case ambient   // constrained: quiet countdown to the reset
             case urgent    // live drain will hit the cap before relief
+            case fumes     // meter exhausted but requests still landing
         }
 
         let sparkLevels: [Double]
@@ -2071,6 +2119,11 @@ enum StatusBarText {
         if let capText = capText(quota: quota, burn: burn) {
             return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: capText, detailStyle: .urgent)
         }
+        // Meter exhausted but the server is still landing requests: say so
+        // instead of showing a dead 0%.
+        if quota.isOnFumes {
+            return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: quota.resetText, detailStyle: .fumes)
+        }
         if remainingPercent <= 30 {
             return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: quota.resetText, detailStyle: .ambient)
         }
@@ -2084,6 +2137,7 @@ enum StatusBarText {
         switch snapshot.quotas.first(where: { $0.engine == "Codex" && $0.window == "5h" })?.paceState {
         case .good: return burnLive ? .systemGreen : .labelColor
         case .hot: return .systemOrange
+        case .fumes: return .systemOrange
         case .critical: return .systemRed
         default: return .labelColor
         }
@@ -2105,9 +2159,11 @@ enum StatusBarText {
         ]))
         if parts.detailStyle != .none {
             // Quiet countdown vs urgent cap ETA: the small text carries
-            // the meaning through weight and colour, not words.
+            // the meaning through weight and colour, not words. Fumes is the
+            // one state that needs a word - "0%" alone reads as dead.
             let urgent = parts.detailStyle == .urgent
-            title.append(NSAttributedString(string: " " + parts.detailText, attributes: [
+            let detail = parts.detailStyle == .fumes ? "fumes \(parts.detailText)" : parts.detailText
+            title.append(NSAttributedString(string: " " + detail, attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: urgent ? .semibold : .regular),
                 .foregroundColor: urgent ? (color == .labelColor ? .systemOrange : color) : NSColor.secondaryLabelColor
             ]))
@@ -2125,6 +2181,7 @@ enum StatusBarText {
         case .none: break
         case .ambient: pieces.append("-\(parts.detailText)")
         case .urgent: pieces.append("cap \(parts.detailText)")
+        case .fumes: pieces.append("fumes -\(parts.detailText)")
         }
         return pieces.joined(separator: " ")
     }
@@ -2154,7 +2211,10 @@ enum StatusBarText {
         } else {
             paceLine = "Pace: idle"
         }
-        return "Codex 5h: \(fiveHourText)\nCodex week: \(weeklyText)\n\(paceLine)\n\(resetAllowance)"
+        let servingNote = fiveHour?.isOnFumes == true
+            ? "\nMeter exhausted but requests are still landing. The 5h window is rolling, so capacity trickles back before the full reset."
+            : ""
+        return "Codex 5h: \(fiveHourText)\nCodex week: \(weeklyText)\(servingNote)\n\(paceLine)\n\(resetAllowance)"
     }
 
     private static func resetAllowanceText(for snapshot: PaceSnapshot) -> String {
@@ -3125,6 +3185,7 @@ struct PacePanelView: View {
         switch quota.paceState {
         case .good: return PaceTheme.green
         case .hot: return PaceTheme.amber
+        case .fumes: return PaceTheme.amber
         case .critical: return PaceTheme.coral
         case .unknown: return PaceTheme.muted
         }

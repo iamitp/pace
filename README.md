@@ -19,6 +19,7 @@ It also reads the wire-level rate limits that actually gate the Codex engine - t
 - Live thrust bars in the menu bar (2s latency whilst a session writes, zero cost idle)
 - One big quota percentage
 - Conditional cap ETA (e.g. "empty in 38m" only when the burn would beat the reset)
+- Fumes state: "0% fumes" in amber when the meter is exhausted but the server is still landing requests, red only when they actually bounce
 - Popover with 15-minute thrust chart
 - 5-hour and weekly quota pools, including multiple weekly pools
 - Banked reset credits with expiry dates and full redeemed/expired history
@@ -71,6 +72,10 @@ An experimental combined mode exists - toggle "Also track Claude Code" in the se
 **What do the menu bar elements mean?**
 
 The bars are live thrust (token flow over the last few minutes, faded-to-solid). The big number is the percentage of the 5-hour window remaining. The small number appears only when it matters: a dim countdown to the reset when you are low, or a bold cap ETA when your current burn would empty the window before the reset rescues you.
+
+**Why does it say "0% fumes" instead of just 0%?**
+
+Because 100% on the meter is a report, not a cutoff. The 5-hour window is rolling and enforcement happens per request, so a session can keep working at "0% left" whilst capacity trickles back. Pace reads the server's actual verdict (`rate_limit_reached_type`) from the live session log: amber "fumes" means requests are still landing, red means they have actually started bouncing.
 
 ## Licence
 
