@@ -62,7 +62,7 @@ The build script generates a deterministic macOS `.icns` app icon and embeds it,
 
 **Why does Pace disagree with the ChatGPT app's Usage panel?**
 
-They are different meters. Since the July 2026 unification, the app's Usage panel reports the shared agentic pool, while the Codex engine's own sessions stream wire-level `rate_limits` that can sit at a very different number (observed 60+ points apart on launch day). Pace reads the wire meter, because that is the one that stops your sessions.
+They are different meters. Since the July 2026 unification, the app's Usage panel reports the shared agentic pool, while the Codex engine's own sessions stream wire-level `rate_limits` that can sit at a very different number (observed 60+ points apart on launch day - and we have watched sessions sail past a full 5h wire meter and keep billing the weekly one). No single number tells the whole story, so Pace watches the wire meters across every pool (5h, weekly, extras) and shows you what is actually draining.
 
 **Does Pace support Claude Code?**
 
