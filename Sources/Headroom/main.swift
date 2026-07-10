@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Foundation
 import Combine
+import ServiceManagement
 
 let homeURL = FileManager.default.homeDirectoryForCurrentUser
 
@@ -28,7 +29,9 @@ enum PaceTheme {
 
 enum RefreshCadence {
     static var renderRefresh: TimeInterval { LocalMode.isCodexOnly ? 1.0 : 0.025 }
-    static var livePaceRefresh: TimeInterval { LocalMode.isCodexOnly ? 10.0 : 0.25 }
+    // Codex-only live tick is 2s: burn ingestion is burn-only + tail-read +
+    // date-scoped discovery, so each tick costs single-digit milliseconds.
+    static var livePaceRefresh: TimeInterval { LocalMode.isCodexOnly ? 2.0 : 0.25 }
     static var fullRefresh: TimeInterval { LocalMode.isCodexOnly ? 60.0 : 30.0 }
     static var feedRefreshIfOlderThan: TimeInterval { LocalMode.isCodexOnly ? 30.0 : 20.0 }
 }
@@ -85,7 +88,7 @@ struct PaceSnapshot {
     var codexResetsHistory: [ResetCredit] = []
     var codexWeeklyPools: [WeeklyPool] = []
 
-    static func collect(refreshFeeds: Bool = false, includeSlowReadings: Bool = true, previous: PaceSnapshot? = nil, statusOnly: Bool = false) -> PaceSnapshot {
+    static func collect(refreshFeeds: Bool = false, includeSlowReadings: Bool = true, previous: PaceSnapshot? = nil, statusOnly: Bool = false, burnOnly: Bool = false) -> PaceSnapshot {
         if DistributionMode.isAppStore {
             return AppStoreSnapshotReader.read()
         }
@@ -100,11 +103,11 @@ struct PaceSnapshot {
         snapshot.sourceGeneratedAt = Date()
         snapshot.sourceIsSample = false
         if LocalMode.isCodexOnly {
-            snapshot.quotas = QuotaReader.read(engine: "Codex", relativePath: ".claude/codex-usage.json", weeklyKey: "secondary")
+            snapshot.quotas = QuotaReader.read(engine: "Codex", feedURL: PaceFeedPaths.codexFeed, weeklyKey: "secondary")
         } else {
             snapshot.quotas = [
                 QuotaReader.read(engine: "Claude", relativePath: ".claude/claude-usage.json", weeklyKey: "weekly"),
-                QuotaReader.read(engine: "Codex", relativePath: ".claude/codex-usage.json", weeklyKey: "secondary")
+                QuotaReader.read(engine: "Codex", feedURL: PaceFeedPaths.codexFeed, weeklyKey: "secondary")
             ].flatMap { $0 }
         }
         let metadata = CodexUsageMetadataReader.read()
@@ -116,6 +119,11 @@ struct PaceSnapshot {
         snapshot.codexWeeklyPools = metadata.weeklyPools
         if statusOnly {
             snapshot.burnRates = previous?.burnRates ?? []
+            snapshot.sessions = previous?.sessions ?? []
+            snapshot.history = previous?.history ?? HistoryReading.empty
+        } else if burnOnly {
+            // The 2s bar tick: fresh quotas + burn, everything slow reused.
+            snapshot.burnRates = BurnRateReader.read(quotas: snapshot.quotas, scope: .live)
             snapshot.sessions = previous?.sessions ?? []
             snapshot.history = previous?.history ?? HistoryReading.empty
         } else {
@@ -175,6 +183,9 @@ struct PaceSnapshot {
         let graphBuckets = burnRates.map { $0.points.count }.max() ?? 0
         let graphActive = burnRates.reduce(0) { $0 + $1.activeSessions }
         lines.append("pace_graph=buckets=\(graphBuckets) active_sessions=\(graphActive) render_refresh=\(Int(RefreshCadence.renderRefresh * 1000))ms live_ingest=\(Int(RefreshCadence.livePaceRefresh * 1000))ms full_refresh=\(Int(RefreshCadence.fullRefresh))s primary_rate=\"\(burnRates.sorted { $0.tokensPerMinute > $1.tokensPerMinute }.first?.tokensPerMinuteText ?? "idle")\"")
+        if LocalMode.isCodexOnly {
+            lines.append("status_bar_title=\"\(StatusBarText.codexTitle(for: self))\"")
+        }
         lines.append("sessions_recent=\(sessions.count)")
         for session in sessions.prefix(5) {
             lines.append("session \(session.source): \"\(session.title)\" workspace=\"\(session.workspace)\" cwd=\"\(session.cwd)\" tokens=\(session.tokens) basis=\"\(session.tokenBasis)\" status=\(session.status)")
@@ -499,6 +510,31 @@ struct BurnReading: Identifiable {
         if age < 15 * 60 { return "cooling" }
         return "idle"
     }
+
+    // Three-bucket thrust levels (0…1) for the menu bar. Present only while
+    // tokens are flowing (live/fresh); empty so the idle bar stays clean.
+    var barSparkLevels: [Double] {
+        guard freshness == "live" || freshness == "fresh" else { return [] }
+        let recent = points.suffix(3)
+        guard !recent.isEmpty else { return [] }
+        let peak = max(points.map(\.tokensPerMinute).max() ?? 0, 1)
+        return recent.map { min(1, max(0, $0.tokensPerMinute / peak)) }
+    }
+
+    // Glyph rendering of the same levels for the text dump.
+    var barSparkline: String {
+        let glyphs: [Character] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇"]
+        return String(barSparkLevels.map { level in
+            glyphs[min(glyphs.count - 1, max(0, Int((level * Double(glyphs.count - 1)).rounded())))]
+        })
+    }
+
+    // Minutes until the 5h cap at the current observed drain rate, or nil when
+    // there is no live quota-delta evidence to project from.
+    var capMinutes: Double? {
+        guard let quotaPercentPerMinute, quotaPercentPerMinute > 0.01, let remainingPercent else { return nil }
+        return remainingPercent / quotaPercentPerMinute
+    }
 }
 
 struct HistoryReading {
@@ -544,7 +580,10 @@ struct ResetCredit {
 
 enum QuotaReader {
     static func read(engine: String, relativePath: String, weeklyKey: String) -> [QuotaReading] {
-        let path = homeURL.appendingPathComponent(relativePath)
+        read(engine: engine, feedURL: homeURL.appendingPathComponent(relativePath), weeklyKey: weeklyKey)
+    }
+
+    static func read(engine: String, feedURL path: URL, weeklyKey: String) -> [QuotaReading] {
         guard
             let data = try? Data(contentsOf: path),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -629,7 +668,7 @@ enum CodexUsageMetadataReader {
     }
 
     static func read() -> Metadata {
-        let path = homeURL.appendingPathComponent(".claude/codex-usage.json")
+        let path = PaceFeedPaths.codexFeed
         guard
             let data = try? Data(contentsOf: path),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -710,6 +749,211 @@ enum CodexUsageMetadataReader {
     }
 }
 
+enum PaceFeedPaths {
+    static var appSupportDir: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? homeURL.appendingPathComponent("Library/Application Support")
+        let dir = base.appendingPathComponent("Pace", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    static var externalCodexFeed: URL { homeURL.appendingPathComponent(".claude/codex-usage.json") }
+    static var nativeCodexFeed: URL { appSupportDir.appendingPathComponent("codex-usage.json") }
+    static var nativeResetLedger: URL { appSupportDir.appendingPathComponent("codex-resets-ledger.json") }
+
+    // Freshest available feed wins: machines running an external poller keep
+    // the ~/.claude file newest; plain installs only ever have the native one.
+    static var codexFeed: URL {
+        mtime(externalCodexFeed) >= mtime(nativeCodexFeed) ? externalCodexFeed : nativeCodexFeed
+    }
+
+    private static func mtime(_ url: URL) -> Date {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    }
+}
+
+// Native port of codex-usage-poll.py so public installs need no external
+// scripts: polls the same wham endpoints the Codex app uses, with the token
+// from ~/.codex/auth.json, and maintains the reset-credit ledger locally -
+// the wham API drops a credit from its response once redeemed or expired,
+// so this ledger is the only durable history.
+enum NativeUsagePoller {
+    private static let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
+    private static let creditsURL = URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")!
+
+    static func poll() {
+        guard let auth = authToken() else { return }
+        guard let usage = fetchJSON(usageURL, token: auth.token, account: auth.account),
+              let rate = usage["rate_limit"] as? [String: Any] else { return }
+        var out: [String: Any] = [
+            "updated_at": Int(Date().timeIntervalSince1970),
+            "source_reading_at": ISO8601DateFormatter().string(from: Date()),
+            "source": "wham/usage"
+        ]
+        out["plan_type"] = usage["plan_type"]
+        out["account_email"] = usage["email"]
+        out["account_id"] = usage["account_id"]
+        if let window = windowDict(rate["primary_window"]) { out["primary"] = window }
+        if let window = windowDict(rate["secondary_window"]) { out["secondary"] = window }
+        var pools: [[String: Any]] = []
+        if var main = windowDict(rate["secondary_window"]) {
+            main["name"] = "Codex"
+            pools.append(main)
+        }
+        for extra in (usage["additional_rate_limits"] as? [[String: Any]]) ?? [] {
+            let name = (extra["limit_name"] as? String) ?? (extra["metered_feature"] as? String) ?? "Codex"
+            if let sub = extra["rate_limit"] as? [String: Any], var window = windowDict(sub["secondary_window"]) {
+                window["name"] = name
+                pools.append(window)
+            }
+        }
+        out["weekly_pools"] = pools
+        if let creditsPayload = fetchJSON(creditsURL, token: auth.token, account: auth.account) {
+            let all = (creditsPayload["credits"] as? [[String: Any]]) ?? []
+            out["resets_history"] = reconcileLedger(credits: all)
+            let available = all.filter { ($0["status"] as? String) == "available" }
+            out["resets_detail"] = available.compactMap { credit -> [String: Any]? in
+                guard let expires = credit["expires_at"] else { return nil }
+                var entry: [String: Any] = ["expires_at": expires, "label": creditLabel(credit)]
+                entry["granted_at"] = credit["granted_at"]
+                return entry
+            }
+            if let count = creditsPayload["available_count"] as? Int { out["resets_available"] = count }
+            let expiries = available.compactMap { $0["expires_at"] as? String }.sorted()
+            if let first = expiries.first {
+                out["resets_next_expiry"] = first
+                out["resets_expire_at"] = first
+                out["resets_expiries"] = expiries
+            }
+        } else if let summary = usage["rate_limit_reset_credits"] as? [String: Any],
+                  let count = summary["available_count"] as? Int {
+            out["resets_available"] = count
+        }
+        let (model, effort) = codexModel()
+        if let model { out["model"] = model }
+        if let effort { out["model_reasoning_effort"] = effort }
+        writeAtomically(out, to: PaceFeedPaths.nativeCodexFeed)
+    }
+
+    private static func authToken() -> (token: String, account: String)? {
+        let url = homeURL.appendingPathComponent(".codex/auth.json")
+        guard let data = try? Data(contentsOf: url),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        let tokens = (object["tokens"] as? [String: Any]) ?? [:]
+        let token = ((tokens["access_token"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return nil }
+        let account = ((tokens["account_id"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return (token, account)
+    }
+
+    private final class FetchBox: @unchecked Sendable {
+        var value: [String: Any]?
+    }
+
+    private static func fetchJSON(_ url: URL, token: String, account: String) -> [String: Any]? {
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Pace usage poller", forHTTPHeaderField: "User-Agent")
+        if !account.isEmpty { request.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id") }
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = FetchBox()
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            defer { semaphore.signal() }
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), let data else { return }
+            box.value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 10)
+        return box.value
+    }
+
+    private static func windowDict(_ value: Any?) -> [String: Any]? {
+        guard let window = value as? [String: Any] else { return nil }
+        var out: [String: Any] = [:]
+        out["used_percent"] = window["used_percent"]
+        if let seconds = number(window["limit_window_seconds"]) {
+            out["window_minutes"] = Int(seconds / 60)
+        }
+        out["resets_at"] = window["reset_at"]
+        return out
+    }
+
+    private static func creditLabel(_ credit: [String: Any]) -> String {
+        let description = ((credit["description"] as? String) ?? "").lowercased()
+        if description.contains("inviting") { return "Referral" }
+        return (credit["profile_user_id"] as? String) ?? "Codex Team"
+    }
+
+    private static func reconcileLedger(credits: [[String: Any]]) -> [[String: Any]] {
+        let nowISO = ISO8601DateFormatter().string(from: Date())
+        var ledger: [String: Any] = [:]
+        if let data = try? Data(contentsOf: PaceFeedPaths.nativeResetLedger),
+           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            ledger = object
+        }
+        var entries = (ledger["credits"] as? [String: [String: Any]]) ?? [:]
+        var seen = Set<String>()
+        for credit in credits {
+            let cid = (credit["id"] as? String) ?? "\(credit["granted_at"] ?? "")|\(credit["expires_at"] ?? "")"
+            seen.insert(cid)
+            var entry = entries[cid] ?? ["first_seen": nowISO]
+            entry["granted_at"] = credit["granted_at"] ?? entry["granted_at"]
+            entry["expires_at"] = credit["expires_at"] ?? entry["expires_at"]
+            entry["label"] = creditLabel(credit)
+            let status = (credit["status"] as? String) ?? "available"
+            entry["status"] = status
+            entry["last_seen"] = nowISO
+            if status != "available", entry["resolved_at"] == nil {
+                entry["resolved_at"] = credit["redeemed_at"] ?? nowISO
+            }
+            entries[cid] = entry
+        }
+        // Credits the API stopped returning were consumed or lapsed; record which.
+        for (cid, entry) in entries {
+            let status = entry["status"] as? String
+            guard !seen.contains(cid), status == nil || status == "available" else { continue }
+            var updated = entry
+            let lapsed = DateParsers.any(entry["expires_at"]).map { Date() >= $0 } ?? false
+            updated["status"] = lapsed ? "expired" : "redeemed"
+            if updated["resolved_at"] == nil { updated["resolved_at"] = nowISO }
+            entries[cid] = updated
+        }
+        ledger["credits"] = entries
+        writeAtomically(ledger, to: PaceFeedPaths.nativeResetLedger)
+        return entries.values
+            .filter { ($0["status"] as? String) != "available" && $0["expires_at"] != nil }
+            .sorted { (($0["resolved_at"] as? String) ?? "") > (($1["resolved_at"] as? String) ?? "") }
+            .prefix(8)
+            .map { entry in
+                var out: [String: Any] = ["label": (entry["label"] as? String) ?? "Codex Team"]
+                out["granted_at"] = entry["granted_at"]
+                out["expires_at"] = entry["expires_at"]
+                out["status"] = entry["status"]
+                out["resolved_at"] = entry["resolved_at"]
+                return out
+            }
+    }
+
+    private static func codexModel() -> (model: String?, effort: String?) {
+        guard let text = try? String(contentsOf: homeURL.appendingPathComponent(".codex/config.toml"), encoding: .utf8) else {
+            return (nil, nil)
+        }
+        func capture(_ pattern: String) -> String? {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]),
+                  let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  let range = Range(match.range(at: 1), in: text) else { return nil }
+            return String(text[range])
+        }
+        return (capture("^\\s*model\\s*=\\s*\"([^\"]+)\""), capture("^\\s*model_reasoning_effort\\s*=\\s*\"([^\"]+)\""))
+    }
+
+    private static func writeAtomically(_ object: [String: Any], to url: URL) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+}
+
 enum QuotaFeedRefresher {
     private static let feeds = [
         ("Claude", ".claude/claude-usage.json", ".claude/claude-usage-poll.py"),
@@ -718,10 +962,18 @@ enum QuotaFeedRefresher {
 
     static func refreshLocalFeedsIfNeeded() {
         let selectedFeeds = LocalMode.isCodexOnly ? feeds.filter { $0.0 == "Codex" } : feeds
-        for (_, feedPath, scriptPath) in selectedFeeds {
-            let feed = homeURL.appendingPathComponent(feedPath)
-            guard shouldRefresh(feed) else { continue }
-            runPythonScript(homeURL.appendingPathComponent(scriptPath))
+        for (engine, feedPath, scriptPath) in selectedFeeds {
+            let script = homeURL.appendingPathComponent(scriptPath)
+            if FileManager.default.isReadableFile(atPath: script.path) {
+                let feed = homeURL.appendingPathComponent(feedPath)
+                guard shouldRefresh(feed) else { continue }
+                runPythonScript(script)
+            } else if engine == "Codex" {
+                // No external poller on this machine (public install): poll
+                // the wham endpoints natively into Application Support.
+                guard shouldRefresh(PaceFeedPaths.nativeCodexFeed) else { continue }
+                NativeUsagePoller.poll()
+            }
         }
     }
 
@@ -863,9 +1115,27 @@ enum BurnRateReader {
         return readCodexEvents(scope: scope) + readClaudeEvents(scope: scope)
     }
 
-    private static func readCodexEvents(scope: ReadScope) -> [BurnEvent] {
+    // Rollouts are laid out by date (sessions/yyyy/MM/dd); anything live is in
+    // today's or yesterday's directory, so scan just those instead of walking
+    // months of history on every tick. Falls back to the full tree when the
+    // scoped directories are empty (fresh installs, clock oddities).
+    static func codexRecentFiles(limit: Int) -> [URL] {
         let root = homeURL.appendingPathComponent(".codex/sessions")
-        return recentJSONLFiles(root: root, limit: scope.maxFilesPerRoot).flatMap { file in
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy/MM/dd"
+        let days = [Date(), Calendar.current.date(byAdding: .day, value: -1, to: Date()) ?? Date()]
+        let scoped = days.flatMap { recentJSONLFiles(root: root.appendingPathComponent(formatter.string(from: $0)), limit: limit) }
+        guard !scoped.isEmpty else {
+            return recentJSONLFiles(root: root, limit: limit)
+        }
+        return Array(scoped.sorted {
+            ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) >
+            ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+        }.prefix(limit))
+    }
+
+    private static func readCodexEvents(scope: ReadScope) -> [BurnEvent] {
+        return codexRecentFiles(limit: scope.maxFilesPerRoot).flatMap { file in
             recentLines(file, limit: scope.maxLinesPerFile).compactMap { line -> BurnEvent? in
                 guard let object = jsonObject(line),
                       let timestamp = DateParsers.any(object["timestamp"]),
@@ -935,9 +1205,29 @@ enum BurnRateReader {
         }.prefix(limit).map { $0 }
     }
 
+    // The newest rollout file's mtime is the cheapest "is anything running"
+    // signal; it gates the always-on bar refresh so idle periods cost nothing.
+    static func codexActivity(within seconds: TimeInterval) -> Bool {
+        guard let newest = codexRecentFiles(limit: 1).first,
+              let modified = try? newest.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        else { return false }
+        return Date().timeIntervalSince(modified) < seconds
+    }
+
     private static func recentLines(_ file: URL, limit: Int) -> Array<Substring> {
-        let text = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
-        return Array(text.split(separator: "\n").suffix(limit))
+        // Tail-read: long-running rollout files grow to many MB, and the live
+        // refresh only needs the last `limit` lines. 256 KB covers that with
+        // huge margin without loading the whole file each tick.
+        let maxBytes: UInt64 = 262_144
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return [] }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let offset = size > maxBytes ? size - maxBytes : 0
+        guard (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.readToEnd() else { return [] }
+        let text = String(decoding: data, as: UTF8.self)
+        var lines = text.split(separator: "\n")
+        if offset > 0, !lines.isEmpty { lines.removeFirst() }
+        return Array(lines.suffix(limit))
     }
 
     private static func jsonObject(_ line: Substring) -> [String: Any]? {
@@ -1142,16 +1432,15 @@ enum SessionReader {
     }
 
     private static func workspaceName(cwd: String, file: URL) -> String {
-        let userName = NSUserName()
         if cwd != "unknown" {
             let name = URL(fileURLWithPath: cwd).lastPathComponent
-            if name == userName { return "home" }
+            if name == NSUserName() { return "home" }
             if !name.isEmpty { return name }
         }
         let parent = file.deletingLastPathComponent().lastPathComponent
         let cleaned = parent
-            .replacingOccurrences(of: "-Users-\(userName)-", with: "")
-            .replacingOccurrences(of: "-Users-\(userName)", with: "home")
+            .replacingOccurrences(of: "-Users-\(NSUserName())-", with: "")
+            .replacingOccurrences(of: "-Users-\(NSUserName())", with: "home")
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return cleaned.isEmpty ? "workspace" : cleaned
     }
@@ -1184,10 +1473,8 @@ enum SystemReader {
 
 enum TodoReader {
     static func read() -> TodoReading {
-        guard let override = ProcessInfo.processInfo.environment["PACE_TODO_FILE"], !override.isEmpty else {
-            return .empty
-        }
-        let path = URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
+        let path = ProcessInfo.processInfo.environment["PACE_TODO_FILE"].map { URL(fileURLWithPath: $0) }
+            ?? homeURL.appendingPathComponent(".pace/todo.md")
         guard let text = try? String(contentsOf: path, encoding: .utf8) else { return .empty }
         let headings = text.split(separator: "\n").filter { $0.hasPrefix("## ") }
         return TodoReading(
@@ -1466,8 +1753,8 @@ enum AppStoreSnapshotReader {
             BurnReading(engine: "Claude", tokens: 42000, tokensPerMinute: 2800, windowSeconds: 15 * 60, quotaPercentPerMinute: nil, remainingPercent: 82, activeSessions: 1, lastEventAt: Date().addingTimeInterval(-120), points: syntheticPacePoints(totalTokens: 42000, windowSeconds: 15 * 60))
         ]
         snapshot.sessions = [
-            SessionReading(id: "sample-1", source: "Codex", repo: "your-project", title: "Prepare direct release packet", workspace: "your-project", cwd: "/Users/you/projects/your-project", model: "gpt-5.5", status: "running", tokens: 1320000, tokenBasis: "snapshot", lastActivity: Date().addingTimeInterval(-180)),
-            SessionReading(id: "sample-2", source: "Codex", repo: "another-project", title: "Import usage snapshot", workspace: "another-project", cwd: "/Users/you/projects/another-project", model: "gpt-5.5", status: "done", tokens: 428000, tokenBasis: "snapshot", lastActivity: Date().addingTimeInterval(-2400)),
+            SessionReading(id: "sample-1", source: "Codex", repo: "release-readiness", title: "Prepare direct release packet", workspace: "release-readiness", cwd: "/Users/you/projects/pace", model: "gpt-5.5", status: "running", tokens: 1320000, tokenBasis: "snapshot", lastActivity: Date().addingTimeInterval(-180)),
+            SessionReading(id: "sample-2", source: "Codex", repo: "snapshot-import", title: "Import usage snapshot", workspace: "snapshot-import", cwd: "/Users/you/Library/Mobile Documents/com~apple~CloudDocs/Pace", model: "gpt-5.5", status: "done", tokens: 428000, tokenBasis: "snapshot", lastActivity: Date().addingTimeInterval(-2400)),
             SessionReading(id: "sample-3", source: "Local", repo: "pace-ui", title: "Tune Pace menu panel", workspace: "pace-ui", cwd: "/Users/you/projects/pace", model: "review fixture", status: "done", tokens: 206000, tokenBasis: "snapshot", lastActivity: Date().addingTimeInterval(-7200))
         ]
         snapshot.history = HistoryReader.history(from: snapshot.sessions)
@@ -1539,12 +1826,12 @@ final class PaceStore: ObservableObject {
         }
     }
 
-    func refresh(refreshFeeds: Bool = false, includeSlowReadings: Bool = true, statusOnly: Bool = false) {
+    func refresh(refreshFeeds: Bool = false, includeSlowReadings: Bool = true, statusOnly: Bool = false, burnOnly: Bool = false) {
         guard !isRefreshing else { return }
         isRefreshing = true
         let previous = snapshot
         Task.detached {
-            let next = PaceSnapshot.collect(refreshFeeds: refreshFeeds, includeSlowReadings: includeSlowReadings, previous: previous, statusOnly: statusOnly)
+            let next = PaceSnapshot.collect(refreshFeeds: refreshFeeds, includeSlowReadings: includeSlowReadings, previous: previous, statusOnly: statusOnly, burnOnly: burnOnly)
             let reloadedInsights = SessionInsightStore.load()
             await MainActor.run {
                 self.snapshot = next
@@ -1556,6 +1843,10 @@ final class PaceStore: ObservableObject {
 
     func refreshLivePace() {
         refresh(refreshFeeds: false, includeSlowReadings: false)
+    }
+
+    func refreshBurn() {
+        refresh(refreshFeeds: false, includeSlowReadings: false, burnOnly: true)
     }
 
     func refreshFull() {
@@ -1581,6 +1872,7 @@ final class StatusBarController: NSObject {
     private let store = PaceStore()
     private var livePaceTimer: Timer?
     private var fullRefreshTimer: Timer?
+    private var liveTick = 0
     private var cancellables = Set<AnyCancellable>()
 
     override init() {
@@ -1610,8 +1902,24 @@ final class StatusBarController: NSObject {
 
         livePaceTimer = Timer.scheduledTimer(withTimeInterval: RefreshCadence.livePaceRefresh, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.popover.isShown else { return }
-                self.store.refreshLivePace()
+                guard let self else { return }
+                if self.popover.isShown {
+                    if LocalMode.isCodexOnly {
+                        // Burn every tick (2s); sessions/history every 5th.
+                        self.liveTick += 1
+                        if self.liveTick % 5 == 0 {
+                            self.store.refreshLivePace()
+                        } else {
+                            self.store.refreshBurn()
+                        }
+                    } else {
+                        self.store.refreshLivePace()
+                    }
+                } else if LocalMode.isCodexOnly, BurnRateReader.codexActivity(within: 300) {
+                    // Feed the bar sparkline while a session is writing;
+                    // the mtime probe keeps idle periods at zero read cost.
+                    self.store.refreshBurn()
+                }
             }
         }
         fullRefreshTimer = Timer.scheduledTimer(withTimeInterval: RefreshCadence.fullRefresh, repeats: true) { [weak self] _ in
@@ -1633,20 +1941,15 @@ final class StatusBarController: NSObject {
     private func updateStatusItem(with snapshot: PaceSnapshot) {
         guard let button = statusItem.button else { return }
         if LocalMode.isCodexOnly {
-            let color: NSColor
-            switch snapshot.quotas.first(where: { $0.engine == "Codex" && $0.window == "5h" })?.paceState {
-            case .good: color = .systemGreen
-            case .hot: color = .systemOrange
-            case .critical: color = .systemRed
-            default: color = .labelColor
+            let color = StatusBarText.codexBarColor(for: snapshot)
+            if let parts = StatusBarText.codexTitleParts(for: snapshot) {
+                button.attributedTitle = StatusBarText.attributedTitle(parts: parts, color: color)
+            } else {
+                button.attributedTitle = NSAttributedString(string: "--", attributes: [
+                    .foregroundColor: NSColor.labelColor,
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .medium)
+                ])
             }
-            button.attributedTitle = NSAttributedString(
-                string: StatusBarText.codexTitle(for: snapshot),
-                attributes: [
-                    .foregroundColor: color,
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .regular), weight: .medium)
-                ]
-            )
             button.image = nil
             button.imagePosition = .noImage
             button.toolTip = StatusBarText.codexTooltip(for: snapshot)
@@ -1685,6 +1988,25 @@ final class StatusBarController: NSObject {
 }
 
 enum StatusIcon {
+    // Tiny drawn bar chart for the menu bar thrust display. Rounded caps,
+    // older buckets faded, newest solid - crisper than font block glyphs.
+    static func sparkImage(levels: [Double], color: NSColor) -> NSImage {
+        let barWidth: CGFloat = 3
+        let gap: CGFloat = 2
+        let height: CGFloat = 11
+        let width = CGFloat(levels.count) * barWidth + CGFloat(max(0, levels.count - 1)) * gap
+        return NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
+            for (index, level) in levels.enumerated() {
+                let barHeight = max(2.5, height * CGFloat(min(1, max(0, level))))
+                let rect = NSRect(x: CGFloat(index) * (barWidth + gap), y: 0, width: barWidth, height: barHeight)
+                let alpha = index == levels.count - 1 ? 1.0 : 0.35 + 0.2 * CGFloat(index)
+                color.withAlphaComponent(alpha).setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 1.5, yRadius: 1.5).fill()
+            }
+            return true
+        }
+    }
+
     static func make() -> NSImage {
         let size = NSSize(width: 22, height: 18)
         let image = NSImage(size: size)
@@ -1722,18 +2044,102 @@ enum StatusIcon {
 }
 
 enum StatusBarText {
-    static func codexTitle(for snapshot: PaceSnapshot) -> String {
+    struct CodexTitleParts {
+        enum DetailStyle {
+            case none      // healthy window: just the percentage
+            case ambient   // constrained: quiet countdown to the reset
+            case urgent    // live drain will hit the cap before relief
+        }
+
+        let sparkLevels: [Double]
+        let percentText: String
+        let detailText: String
+        let detailStyle: DetailStyle
+    }
+
+    static func codexTitleParts(for snapshot: PaceSnapshot) -> CodexTitleParts? {
         guard let quota = snapshot.quotas.first(where: { $0.engine == "Codex" && $0.window == "5h" }),
               let remainingPercent = quota.remainingPercent else {
-            return "--"
+            return nil
         }
+        let burn = snapshot.burnRates.first { $0.engine == "Codex" }
         let pct = "\(Int(remainingPercent.rounded()))%"
-        // Constrained window: count down to relief. Fresh window: count up
-        // since the reset so a glance shows how young the allowance is.
-        if remainingPercent <= 30 {
-            return "\(pct) -\(quota.resetText)"
+        let levels = burn?.barSparkLevels ?? []
+        // Cap ETA outranks reset text, but only when it is the binding
+        // constraint: live drain, hitting within 2h, and before the reset
+        // would grant relief anyway.
+        if let capText = capText(quota: quota, burn: burn) {
+            return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: capText, detailStyle: .urgent)
         }
-        return "\(pct) +\(quota.sinceResetText)"
+        if remainingPercent <= 30 {
+            return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: quota.resetText, detailStyle: .ambient)
+        }
+        return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: "", detailStyle: .none)
+    }
+
+    static func codexBarColor(for snapshot: PaceSnapshot) -> NSColor {
+        // Softer palette: neutral monochrome at rest, green only while
+        // tokens are actually flowing, amber/red reserved for pressure.
+        let burnLive = snapshot.burnRates.first { $0.engine == "Codex" }?.freshness == "live"
+        switch snapshot.quotas.first(where: { $0.engine == "Codex" && $0.window == "5h" })?.paceState {
+        case .good: return burnLive ? .systemGreen : .labelColor
+        case .hot: return .systemOrange
+        case .critical: return .systemRed
+        default: return .labelColor
+        }
+    }
+
+    static func attributedTitle(parts: CodexTitleParts, color: NSColor) -> NSAttributedString {
+        let title = NSMutableAttributedString()
+        if !parts.sparkLevels.isEmpty {
+            let attachment = NSTextAttachment()
+            let image = StatusIcon.sparkImage(levels: parts.sparkLevels, color: color)
+            attachment.image = image
+            attachment.bounds = NSRect(x: 0, y: -1, width: image.size.width, height: image.size.height)
+            title.append(NSAttributedString(attachment: attachment))
+            title.append(NSAttributedString(string: " "))
+        }
+        title.append(NSAttributedString(string: parts.percentText, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .medium),
+            .foregroundColor: color
+        ]))
+        if parts.detailStyle != .none {
+            // Quiet countdown vs urgent cap ETA: the small text carries
+            // the meaning through weight and colour, not words.
+            let urgent = parts.detailStyle == .urgent
+            title.append(NSAttributedString(string: " " + parts.detailText, attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: urgent ? .semibold : .regular),
+                .foregroundColor: urgent ? (color == .labelColor ? .systemOrange : color) : NSColor.secondaryLabelColor
+            ]))
+        }
+        return title
+    }
+
+    static func codexTitle(for snapshot: PaceSnapshot) -> String {
+        guard let parts = codexTitleParts(for: snapshot) else { return "--" }
+        let spark = snapshot.burnRates.first { $0.engine == "Codex" }?.barSparkline ?? ""
+        var pieces = [String]()
+        if !spark.isEmpty { pieces.append(spark) }
+        pieces.append(parts.percentText)
+        switch parts.detailStyle {
+        case .none: break
+        case .ambient: pieces.append("-\(parts.detailText)")
+        case .urgent: pieces.append("cap \(parts.detailText)")
+        }
+        return pieces.joined(separator: " ")
+    }
+
+    static func capText(quota: QuotaReading, burn: BurnReading?) -> String? {
+        guard let burn, burn.freshness == "live", let capMinutes = burn.capMinutes, capMinutes < 120 else { return nil }
+        if let resetAt = quota.resetAt {
+            let resetMinutes = max(0, resetAt.timeIntervalSince(Date()) / 60)
+            guard capMinutes < resetMinutes else { return nil }
+        }
+        if capMinutes < 1 { return "<1m" }
+        if capMinutes < 60 { return "\(Int(capMinutes.rounded()))m" }
+        let hours = Int(capMinutes / 60)
+        let minutes = Int(capMinutes.truncatingRemainder(dividingBy: 60).rounded())
+        return minutes > 0 ? "\(hours)h\(String(format: "%02d", minutes))m" : "\(hours)h"
     }
 
     static func codexTooltip(for snapshot: PaceSnapshot) -> String {
@@ -1742,7 +2148,13 @@ enum StatusBarText {
         let fiveHourText = fiveHour.map { "\($0.remainingPercentText), \($0.usedPercentText), \($0.paceText), \($0.sinceResetText) since reset, resets \($0.resetDetailText)" } ?? "5h unknown"
         let weeklyText = weekly.map { "\($0.remainingPercentText), \($0.usedPercentText), \($0.paceText), \($0.sinceResetText) since reset, resets \($0.resetDetailText)" } ?? "week unknown"
         let resetAllowance = resetAllowanceText(for: snapshot)
-        return "Codex 5h: \(fiveHourText)\nCodex week: \(weeklyText)\n\(resetAllowance)"
+        let paceLine: String
+        if let burn = snapshot.burnRates.first(where: { $0.engine == "Codex" }), burn.tokensPerMinute > 0, burn.freshness != "idle" {
+            paceLine = "Pace: \(burn.tokensPerMinuteText) (\(burn.freshness)) · \(burn.capEstimateText)"
+        } else {
+            paceLine = "Pace: idle"
+        }
+        return "Codex 5h: \(fiveHourText)\nCodex week: \(weeklyText)\n\(paceLine)\n\(resetAllowance)"
     }
 
     private static func resetAllowanceText(for snapshot: PaceSnapshot) -> String {
@@ -1804,6 +2216,30 @@ struct PacePanelView: View {
         .background(PaceTheme.panel)
     }
 
+    // Static composition for self-rendered README screenshots: Menu, Picker
+    // and ScrollView do not survive offscreen ImageRenderer, so this uses a
+    // buttonless header and the Now content directly.
+    var screenshotBody: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                GaugeMark().frame(width: 38, height: 38)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ProductIdentity.displayName).font(.system(size: 18, weight: .semibold))
+                    Text(ProductIdentity.subtitleLocal).font(.caption).foregroundStyle(PaceTheme.muted)
+                }
+                Spacer()
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 18)
+            .padding(.top, 16)
+            .padding(.bottom, 12)
+            Divider()
+            nowView
+        }
+        .frame(width: 480)
+        .background(PaceTheme.panel)
+    }
+
     private var header: some View {
         HStack(spacing: 12) {
             GaugeMark()
@@ -1823,6 +2259,7 @@ struct PacePanelView: View {
             }
             .labelStyle(.iconOnly)
             .help("Refresh")
+            settingsMenu
             if !DistributionMode.isAppStore && !LocalMode.isCodexOnly {
                 Button {
                     NSWorkspace.shared.open(homeURL.appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/\(ProductIdentity.legacyICloudFolderName)"))
@@ -1847,15 +2284,88 @@ struct PacePanelView: View {
         .padding(.bottom, 12)
     }
 
+    private var settingsMenu: some View {
+        Menu {
+            Toggle("Launch at Login", isOn: Binding(
+                get: { SMAppService.mainApp.status == .enabled },
+                set: { enable in
+                    do {
+                        if enable {
+                            try SMAppService.mainApp.register()
+                        } else {
+                            try SMAppService.mainApp.unregister()
+                        }
+                    } catch {
+                        NSLog("Pace: launch-at-login toggle failed: \(error.localizedDescription)")
+                    }
+                }
+            ))
+            if !DistributionMode.isAppStore {
+                Toggle("Also track Claude Code", isOn: Binding(
+                    get: { !LocalMode.isCodexOnly },
+                    set: { _ in switchMode() }
+                ))
+            }
+            Divider()
+            Button("Quit \(ProductIdentity.displayName)") {
+                NSApplication.shared.terminate(nil)
+            }
+        } label: {
+            Label("Settings", systemImage: "gearshape")
+        }
+        .labelStyle(.iconOnly)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Settings")
+    }
+
+    // Mode shapes the status item and timers at init; relaunch to apply.
+    private func switchMode() {
+        UserDefaults.standard.set(!LocalMode.isCodexOnly, forKey: "CodexOnly")
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            NSApplication.shared.terminate(nil)
+        }
+    }
+
+    private var needsOnboarding: Bool {
+        let snapshot = store.snapshot
+        let hasQuota = snapshot.quotas.contains { $0.usedPercent != nil }
+        return !hasQuota && snapshot.sessions.isEmpty && snapshot.burnRates.allSatisfy { $0.tokens == 0 }
+    }
+
+    private var onboardingCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Waiting for Codex data", systemImage: "binoculars")
+                .font(.system(size: 13, weight: .semibold))
+            Text("Pace reads ~/.codex on this Mac. Sign in to the Codex CLI or the ChatGPT desktop app and run something; usage appears here within a minute. Nothing leaves this Mac except a call to OpenAI's own usage endpoint with your token.")
+                .font(.caption)
+                .foregroundStyle(PaceTheme.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(cardFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
+    }
+
     private var nowView: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if needsOnboarding {
+                onboardingCard
+            }
+            thrustHero
             section("Usage") {
                 quotaList
                 if store.snapshot.codexResetsAvailable != nil {
                     bankedResetRow
                 }
             }
-            burnStrip
+            if !LocalMode.isCodexOnly {
+                burnStrip
+            }
             activeSessionHighlights
             sourceBanner
             section("Alerts") {
@@ -1875,6 +2385,92 @@ struct PacePanelView: View {
             }
         }
         .padding(14)
+    }
+
+    // The hero speaks the same language as the menu bar: drawn thrust bars,
+    // one big number, and the cap ETA line when it is the binding constraint.
+    @ViewBuilder
+    private var thrustHero: some View {
+        let burn = store.snapshot.burnRates.sorted { $0.tokensPerMinute > $1.tokensPerMinute }.first
+        let quota = store.snapshot.quotas.first { $0.engine == (burn?.engine ?? "Codex") && $0.window == "5h" }
+        let live = burn.map { $0.freshness == "live" || $0.freshness == "fresh" } ?? false
+        let accent: Color = live ? (burn.map(burnAccent) ?? PaceTheme.green) : PaceTheme.muted
+        let cap = quota.flatMap { StatusBarText.capText(quota: $0, burn: burn) }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(live ? (burn?.tokensPerMinuteText ?? "idle") : "Idle")
+                    .font(.system(size: 24, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(live ? Color.white : PaceTheme.muted)
+                if live, let burn {
+                    Text(burn.freshness)
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(accent.opacity(0.18), in: Capsule())
+                        .foregroundStyle(accent)
+                }
+                Spacer()
+                if let remaining = quota?.remainingPercent {
+                    Text("\(Int(remaining.rounded()))% left")
+                        .font(.system(size: 12, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(PaceTheme.muted)
+                }
+            }
+            thrustBars(burn: burn, accent: accent)
+            HStack(spacing: 5) {
+                if cap != nil {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                }
+                Text(heroFooter(burn: burn, quota: quota, live: live, cap: cap))
+                    .lineLimit(1)
+            }
+            .font(.caption2)
+            .foregroundStyle(cap != nil ? PaceTheme.amber : PaceTheme.muted)
+        }
+        .padding(12)
+        .background(cardFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
+    }
+
+    private func heroFooter(burn: BurnReading?, quota: QuotaReading?, live: Bool, cap: String?) -> String {
+        let resets = quota.map { "resets \($0.resetDetailText)" }
+        if let cap {
+            return (["At this pace: empty in \(cap)", resets] .compactMap { $0 }).joined(separator: " · ")
+        }
+        if let burn, live {
+            let sessions = "\(burn.activeSessions) session\(burn.activeSessions == 1 ? "" : "s")"
+            return (["\(burn.tokensText) over \(burn.windowDurationText)", sessions, resets].compactMap { $0 }).joined(separator: " · ")
+        }
+        if let last = burn?.lastEventAt {
+            return (["Last activity \(relativeTime(last))", resets].compactMap { $0 }).joined(separator: " · ")
+        }
+        return (["No recent activity", resets].compactMap { $0 }).joined(separator: " · ")
+    }
+
+    private func thrustBars(burn: BurnReading?, accent: Color) -> some View {
+        let points = burn?.points ?? []
+        let peak = max(points.map(\.tokensPerMinute).max() ?? 0, 1)
+        return HStack(alignment: .bottom, spacing: 6) {
+            if points.isEmpty {
+                ForEach(0..<12, id: \.self) { _ in
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(PaceTheme.muted.opacity(0.18))
+                        .frame(height: 3)
+                        .frame(maxWidth: .infinity)
+                }
+            } else {
+                ForEach(Array(points.enumerated()), id: \.offset) { index, point in
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(accent.opacity(index == points.count - 1 ? 1.0 : 0.25 + 0.6 * Double(index) / Double(max(1, points.count - 1))))
+                        .frame(height: max(3, 44 * point.tokensPerMinute / peak))
+                        .frame(maxWidth: .infinity)
+                }
+            }
+        }
+        .frame(height: 44, alignment: .bottom)
     }
 
     // The live burn, as a compact strip rather than a graph: the sparkline did
@@ -2227,9 +2823,14 @@ struct PacePanelView: View {
                     .font(.caption2)
                     .foregroundStyle(quota.paceState == .good ? PaceTheme.muted : accent)
                     .monospacedDigit()
-                ProgressView(value: quota.remainingPercent ?? 0, total: 100)
-                    .tint(accent)
-                    .frame(width: 118)
+                // Custom capsule instead of ProgressView: renders offscreen
+                // (README screenshots) and matches the thrust-bar language.
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.08))
+                    Capsule().fill(accent)
+                        .frame(width: 118 * CGFloat(min(100, max(0, quota.remainingPercent ?? 0))) / 100)
+                }
+                .frame(width: 118, height: 5)
             }
         }
         .padding(.horizontal, 12)
@@ -2870,6 +3471,71 @@ func shell(_ command: String) -> String {
 let args = CommandLine.arguments
 if args.contains("--dump-summary") {
     print(PaceSnapshot.collect(refreshFeeds: true).dumpText)
+    exit(0)
+}
+struct BarMockView: View {
+    let levels: [Double]
+    let percent: String
+    let detail: String
+    let urgent: Bool
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 5) {
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(Array(levels.enumerated()), id: \.offset) { index, level in
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(color.opacity(index == levels.count - 1 ? 1 : 0.35 + 0.2 * Double(index)))
+                        .frame(width: 3, height: max(2.5, 11 * level))
+                }
+            }
+            Text(percent)
+                .font(.system(size: 12.5, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(color)
+            if !detail.isEmpty {
+                Text(detail)
+                    .font(.system(size: 10.5, weight: urgent ? .semibold : .regular))
+                    .monospacedDigit()
+                    .foregroundStyle(urgent ? color : Color.white.opacity(0.55))
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 26)
+        .background(Color(white: 0.11), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+if let flagIndex = args.firstIndex(of: "--screenshot"), args.count > flagIndex + 1 {
+    // Self-rendered README screenshots: no Screen Recording permission needed.
+    let dir = URL(fileURLWithPath: args[flagIndex + 1], isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let store = PaceStore()
+    store.snapshot = PaceSnapshot.collect(refreshFeeds: true)
+
+    func writePNG<Content: View>(_ view: Content, name: String) {
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return }
+        try? png.write(to: dir.appendingPathComponent(name))
+        print("wrote \(name)")
+    }
+
+    writePNG(PacePanelView(store: store).screenshotBody.fixedSize(horizontal: false, vertical: true), name: "popover.png")
+    writePNG(
+        BarMockView(levels: [0.35, 0.7, 1.0], percent: "62%", detail: "38m", urgent: true, color: Color(nsColor: .systemOrange))
+            .padding(8).background(Color(white: 0.16)),
+        name: "menubar.png"
+    )
+    exit(0)
+}
+if args.contains("--native-poll") {
+    // Diagnostic: exercise the built-in wham poller (the public-install path)
+    // regardless of any external poller scripts on this machine.
+    NativeUsagePoller.poll()
+    print((try? String(contentsOf: PaceFeedPaths.nativeCodexFeed, encoding: .utf8)) ?? "no native feed written")
     exit(0)
 }
 

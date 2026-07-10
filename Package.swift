@@ -3,14 +3,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "Pace",
+    name: "Headroom",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "Pace", targets: ["Pace"])
+        .executable(name: "Headroom", targets: ["Headroom"])
     ],
     targets: [
-        .executableTarget(name: "Pace")
+        .executableTarget(name: "Headroom")
     ]
 )

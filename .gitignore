@@ -1,7 +1,5 @@
 .build/
-.DS_Store
 dist/
-*.xcuserstate
-private_keys/
-
-launch/
+release/
+*.zip
+.DS_Store
