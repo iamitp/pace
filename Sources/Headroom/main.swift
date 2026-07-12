@@ -1176,9 +1176,44 @@ enum BurnRateReader {
         }.prefix(limit))
     }
 
+    // Most files surfaced by discovery haven't changed between ticks — only
+    // the actively-streaming rollout grows. Re-parsing unchanged tails every
+    // 2s wasted the bulk of the tick, so parses are cached per (size, mtime).
+    private struct EventCacheEntry {
+        let size: UInt64
+        let mtime: Date
+        let lineLimit: Int
+        let events: [BurnEvent]
+    }
+    nonisolated(unsafe) private static var eventCache: [String: EventCacheEntry] = [:]
+    private static let eventCacheLock = NSLock()
+
     private static func readCodexEvents(scope: ReadScope) -> [BurnEvent] {
-        return codexRecentFiles(limit: scope.maxFilesPerRoot).flatMap { file in
-            recentLines(file, limit: scope.maxLinesPerFile).compactMap { line -> BurnEvent? in
+        let files = codexRecentFiles(limit: scope.maxFilesPerRoot)
+        return files.flatMap { file -> [BurnEvent] in
+            let attributes = try? FileManager.default.attributesOfItem(atPath: file.path)
+            let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+            let mtime = (attributes?[.modificationDate] as? Date) ?? .distantPast
+            eventCacheLock.lock()
+            let cached = eventCache[file.path]
+            eventCacheLock.unlock()
+            if let cached, cached.size == size, cached.mtime == mtime, cached.lineLimit >= scope.maxLinesPerFile {
+                return cached.events
+            }
+            let events = parseCodexEvents(file: file, limit: scope.maxLinesPerFile)
+            eventCacheLock.lock()
+            eventCache[file.path] = EventCacheEntry(size: size, mtime: mtime, lineLimit: scope.maxLinesPerFile, events: events)
+            if eventCache.count > 256 {
+                let keep = Set(files.map(\.path))
+                eventCache = eventCache.filter { keep.contains($0.key) }
+            }
+            eventCacheLock.unlock()
+            return events
+        }
+    }
+
+    private static func parseCodexEvents(file: URL, limit: Int) -> [BurnEvent] {
+        return recentLines(file, limit: limit).compactMap { line -> BurnEvent? in
                 guard let object = jsonObject(line),
                       let timestamp = DateParsers.any(object["timestamp"]),
                       let payload = object["payload"] as? [String: Any],
@@ -1203,7 +1238,6 @@ enum BurnRateReader {
                     session: file.path,
                     rateLimitReached: reached
                 )
-            }
         }
     }
 
@@ -1292,14 +1326,106 @@ enum SessionReader {
                 homeURL.appendingPathComponent(".claude/projects")
             ]
         let fileLimit = LocalMode.isCodexOnly ? min(limit, 30) : 80
-        let files = roots.flatMap { recentJSONLFiles(root: $0, limit: fileLimit) }
+        // The live tick (small limit) only needs what changed recently, so it
+        // scans today's and yesterday's rollout directories instead of walking
+        // the entire dated tree (which grows into the tens of thousands of
+        // files). The launch/history path (large limit) still walks everything.
+        let files = roots.flatMap { root -> [URL] in
+            if limit <= 30, root.path.hasSuffix(".codex/sessions") {
+                return codexScopedFiles(root: root, limit: fileLimit)
+            }
+            return recentJSONLFiles(root: root, limit: fileLimit)
+        }
         return files.compactMap(parseSession).sorted { $0.lastActivity > $1.lastActivity }.prefix(limit).map { $0 }
+    }
+
+    private static func codexScopedFiles(root: URL, limit: Int) -> [URL] {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy/MM/dd"
+        let days = [Date(), Calendar.current.date(byAdding: .day, value: -1, to: Date()) ?? Date()]
+        let scoped = days.flatMap { recentJSONLFiles(root: root.appendingPathComponent(formatter.string(from: $0)), limit: limit) }
+        // Only trust the scoped scan when it can fill the whole list; on
+        // semi-idle Macs (or any date/directory mismatch) fall back to the
+        // full walk so the sessions list never silently shrinks.
+        guard scoped.count >= limit else {
+            return recentJSONLFiles(root: root, limit: limit)
+        }
+        return Array(scoped.sorted {
+            ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) >
+            ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+        }.prefix(limit))
+    }
+
+    // parseSession fully decoded every candidate file on every pass, and live
+    // rollouts run to many MB. Unchanged files are served from a (size, mtime)
+    // cache; only the actively-written file is re-read, and even that read is
+    // head+tail chunks rather than the whole file (the parser only ever looks
+    // at the first and last few dozen lines anyway).
+    private struct SessionCacheEntry {
+        let size: UInt64
+        let mtime: Date
+        let reading: SessionReading
+    }
+    nonisolated(unsafe) private static var sessionCache: [String: SessionCacheEntry] = [:]
+    private static let sessionCacheLock = NSLock()
+
+    private static func refreshedStatus(_ reading: SessionReading) -> SessionReading {
+        guard reading.status != "done" else { return reading }
+        let age = Date().timeIntervalSince(reading.lastActivity)
+        let status = age < 15 * 60 ? "running" : "waiting"
+        guard status != reading.status else { return reading }
+        return SessionReading(id: reading.id, source: reading.source, repo: reading.repo, title: reading.title, workspace: reading.workspace, cwd: reading.cwd, model: reading.model, status: status, tokens: reading.tokens, tokenBasis: reading.tokenBasis, lastActivity: reading.lastActivity)
+    }
+
+    private static func sessionText(_ url: URL, size: UInt64) -> String {
+        let tailBytes: UInt64 = 393_216
+        let headLineTarget = 60
+        let headByteCap = 4_194_304
+        if size <= tailBytes + 262_144 {
+            return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        // The parser wants the first `headLineTarget` lines, and rollout files
+        // can open with single lines hundreds of KB long — so read forward in
+        // chunks until enough full lines are buffered (with a byte cap).
+        var headData = Data()
+        var lineCount = 0
+        while headData.count < headByteCap && lineCount <= headLineTarget {
+            guard let chunk = try? handle.read(upToCount: 262_144), !chunk.isEmpty else { break }
+            lineCount += chunk.reduce(0) { $1 == 0x0A ? $0 + 1 : $0 }
+            headData.append(chunk)
+        }
+        if UInt64(headData.count) >= size {
+            return String(decoding: headData, as: UTF8.self)
+        }
+        var head = String(decoding: headData, as: UTF8.self)
+        if let cut = head.lastIndex(of: "\n") { head = String(head[..<cut]) }
+        let tailOffset = max(size - tailBytes, UInt64(headData.count))
+        guard (try? handle.seek(toOffset: tailOffset)) != nil,
+              let tailData = try? handle.readToEnd() else { return head }
+        var tail = String(decoding: tailData, as: UTF8.self)
+        if let cut = tail.firstIndex(of: "\n") { tail = String(tail[tail.index(after: cut)...]) }
+        return head + "\n" + tail
     }
 
     private static func parseSession(_ url: URL) -> SessionReading? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else { return nil }
         let modified = (attributes[.modificationDate] as? Date) ?? .distantPast
-        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        sessionCacheLock.lock()
+        let cached = sessionCache[url.path]
+        sessionCacheLock.unlock()
+        if let cached, cached.size == size, cached.mtime == modified {
+            return refreshedStatus(cached.reading)
+        }
+        // Full mode parses far deeper into each file (prefix 160 + suffix 260
+        // lines, with per-line token summation for Claude sessions), so the
+        // byte-capped chunk read only stands in for the whole-file read in
+        // Codex-only mode, where the parser wants prefix 60 + suffix 120.
+        let text = LocalMode.isCodexOnly
+            ? sessionText(url, size: size)
+            : ((try? String(contentsOf: url, encoding: .utf8)) ?? "")
         let allLines = text.split(separator: "\n")
         let lines: [Substring]
         if LocalMode.isCodexOnly, allLines.count > 180 {
@@ -1393,7 +1519,15 @@ enum SessionReader {
         let tokenBasis = source == "Claude" ? "deduped estimate" : "cumulative log"
         let age = Date().timeIntervalSince(modified)
         let status = done ? "done" : (age < 15 * 60 ? "running" : "waiting")
-        return SessionReading(id: url.path, source: source, repo: title, title: title, workspace: workspace, cwd: cwd, model: model, status: status, tokens: tokens, tokenBasis: tokenBasis, lastActivity: modified)
+        let reading = SessionReading(id: url.path, source: source, repo: title, title: title, workspace: workspace, cwd: cwd, model: model, status: status, tokens: tokens, tokenBasis: tokenBasis, lastActivity: modified)
+        sessionCacheLock.lock()
+        sessionCache[url.path] = SessionCacheEntry(size: size, mtime: modified, reading: reading)
+        if sessionCache.count > 512 {
+            let cutoff = Date().addingTimeInterval(-48 * 3600)
+            sessionCache = sessionCache.filter { $0.value.mtime > cutoff }
+        }
+        sessionCacheLock.unlock()
+        return reading
     }
 
     private static func recentJSONLFiles(root: URL, limit: Int) -> [URL] {
