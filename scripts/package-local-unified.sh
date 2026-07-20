@@ -187,7 +187,7 @@ done
 
 /usr/bin/codesign --force --deep --sign - "$STAGE_APP"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$STAGE_APP"
-HOME="$(mktemp -d "$STAGE_ROOT/.sesh-home.XXXXXX")" "$STAGE_SESH_LAUNCHER" --version | /usr/bin/grep -Fxq 'Sesh 4.2.0' || fail "bundled Sesh version verification failed."
+HOME="$(mktemp -d "$STAGE_ROOT/.sesh-home.XXXXXX")" "$STAGE_SESH_LAUNCHER" --version | /usr/bin/grep -Fxq 'Sesh 5.0.0' || fail "bundled Sesh version verification failed."
 
 mv "$STAGE_APP" "$APP_BUNDLE"
 
