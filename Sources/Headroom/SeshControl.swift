@@ -265,6 +265,7 @@ struct SeshLatestRunStatus: Decodable, Equatable, Sendable {
 
 struct SeshControlStatus: Decodable, Equatable, Sendable {
     let automatic: Bool
+    let economy: String?
     let statePath: String
     let state: SeshControlState
     let schema: Int
@@ -274,6 +275,7 @@ struct SeshControlStatus: Decodable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case automatic
+        case economy
         case statePath = "state_path"
         case state
         case schema
@@ -292,6 +294,7 @@ struct SeshControlStatus: Decodable, Equatable, Sendable {
             )
         }
         automatic = try values.decode(Bool.self, forKey: .automatic)
+        economy = try values.decodeIfPresent(String.self, forKey: .economy)
         statePath = try values.decode(String.self, forKey: .statePath)
         state = try values.decode(SeshControlState.self, forKey: .state)
         schema = try values.decode(Int.self, forKey: .schema)

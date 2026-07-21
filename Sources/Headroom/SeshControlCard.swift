@@ -15,6 +15,7 @@ final class SeshControlController: ObservableObject {
     @Published private(set) var isActing = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var notice: String?
+    @Published private(set) var economyOn = false
 
     private let backend: SeshControlBackend
     private var refreshGeneration = 0
@@ -209,11 +210,10 @@ final class SeshControlController: ObservableObject {
         }
     }
 
-    var economyOn: Bool { status?.automatic ?? true }
-
     func setEconomy(_ on: Bool) {
         guard !isActing else { return }
         let workspace = selection?.url
+        economyOn = on            // optimistic: the switch moves the instant it is tapped
         isActing = true
         errorMessage = nil
         notice = nil
@@ -223,14 +223,14 @@ final class SeshControlController: ObservableObject {
                 try await Task.detached(priority: .userInitiated) {
                     try backend.setEconomyMode(on: on)
                 }.value
-                self.status = try await Task.detached(priority: .userInitiated) {
+                let fresh = try await Task.detached(priority: .userInitiated) {
                     try backend.status(for: workspace)
                 }.value
-                self.notice = on
-                    ? "Economy default on. New native Codex chats start on Terra Medium."
-                    : "Economy default off. Your previous native default is restored."
+                self.status = fresh
+                self.economyOn = (fresh.economy == "on")
             } catch {
                 self.errorMessage = Self.safeMessage(error)
+                self.economyOn = (self.status?.economy == "on")   // revert on failure
             }
             self.isActing = false
         }
@@ -240,6 +240,9 @@ final class SeshControlController: ObservableObject {
         status = payload.status
         selection = payload.selection
         errorMessage = payload.errorMessage
+        if let economy = payload.status?.economy {
+            economyOn = (economy == "on")
+        }
     }
 
     nonisolated private static func readPayload(
@@ -317,128 +320,42 @@ struct SeshControlCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Label("Sesh automatic", systemImage: "gearshape.2.fill")
+                Label("Economy mode", systemImage: "leaf.fill")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                if !isStaticRendering && controller.isConductorWorking {
+                if !isStaticRendering && controller.isActing {
                     ProgressView()
                         .controlSize(.small)
-                        .accessibilityIdentifier("sesh-phase-progress")
+                        .accessibilityIdentifier("sesh-economy-progress")
                 }
-                stateBadge
-            }
-
-            Text("Always on. Sesh selects the direct model, effort, and proof for the task.")
-                .font(.caption)
-                .foregroundStyle(PaceTheme.muted)
-                .fixedSize(horizontal: false, vertical: true)
-
-            HStack(spacing: 9) {
-                Image(systemName: "folder")
-                    .foregroundStyle(PaceTheme.blue)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(controller.projectLabel)
-                        .font(.system(size: 12, weight: .semibold))
-                        .lineLimit(1)
-                    Text(controller.projectPath)
-                        .font(.system(size: 10.5, design: .monospaced))
-                        .foregroundStyle(PaceTheme.muted)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                Button(controller.hasProject ? "Change" : "Choose") {
-                    chooseProject()
-                }
-                .controlSize(.small)
-                .disabled(controller.isActing)
-            }
-            .accessibilityIdentifier("sesh-project")
-
-            HStack(spacing: 8) {
-                Button(controller.primaryActionTitle) {
-                    controller.launch(.startOrResume)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(PaceTheme.teal)
-                .disabled(!controller.hasProject || controller.isActing)
-                .accessibilityIdentifier("sesh-start-resume")
-
-                Button("New Managed Task") {
-                    controller.launch(.fresh)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!controller.hasProject || controller.isActing)
-                .accessibilityIdentifier("sesh-new-task")
-
-                if !isStaticRendering && (controller.isActing || controller.isRefreshing) {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-            }
-
-            if let quota = controller.quotaText {
-                evidenceLine(icon: "gauge.with.dots.needle.50percent", text: quota)
-            }
-            if let phase = controller.phaseText {
-                evidenceLine(icon: "arrow.triangle.2.circlepath", text: phase)
-            }
-            if let urgency = controller.urgencyText {
-                evidenceLine(icon: "clock", text: urgency)
-            }
-            if let topology = controller.topologyText {
-                evidenceLine(icon: "point.3.connected.trianglepath.dotted", text: topology)
-            }
-            if let routes = controller.routesText {
-                evidenceLine(icon: "arrow.triangle.branch", text: routes)
-            }
-            if let usage = controller.usageText {
-                evidenceLine(icon: "chart.xyaxis.line", text: usage)
-            }
-            if let verification = controller.verificationText {
-                evidenceLine(icon: "checkmark.seal", text: verification)
-            }
-            if let notice = controller.notice {
-                feedbackLine(notice, color: PaceTheme.green, icon: "checkmark.circle.fill")
-            }
-            if let error = controller.errorMessage {
-                feedbackLine(error, color: PaceTheme.coral, icon: "exclamationmark.triangle.fill")
-            }
-
-            Text("Native New Task gets the automatic policy. Managed tasks launched here add workspace-scoped lifecycle and measured token telemetry.")
-                .font(.system(size: 10.5))
-                .foregroundStyle(PaceTheme.muted)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Divider()
-                .padding(.vertical, 2)
-
-            HStack(alignment: .top, spacing: 9) {
-                Image(systemName: "bolt.horizontal.circle")
-                    .foregroundStyle(controller.economyOn ? PaceTheme.teal : PaceTheme.muted)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Economy default")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("New native Codex chats start on Terra Medium. Running sessions and Pace-managed tasks are unaffected.")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(PaceTheme.muted)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
                 Button {
                     controller.setEconomy(!controller.economyOn)
                 } label: {
                     Text(controller.economyOn ? "ON" : "OFF")
-                        .font(.system(size: 10.5, weight: .bold))
-                        .frame(minWidth: 34)
+                        .font(.system(size: 11, weight: .heavy))
+                        .frame(minWidth: 40)
                 }
                 .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .tint(controller.economyOn ? PaceTheme.teal : PaceTheme.muted)
+                .controlSize(.regular)
+                .tint(controller.economyOn ? PaceTheme.green : PaceTheme.muted)
                 .disabled(controller.isActing)
                 .accessibilityIdentifier("sesh-economy-toggle")
+            }
+
+            Text(controller.economyOn
+                ? "New Codex chats start on the cheaper Terra model (medium effort). Tap OFF for full-power Sol."
+                : "New Codex chats start on the full-power Sol model (high effort). Tap ON for the cheaper Terra model.")
+                .font(.caption)
+                .foregroundStyle(PaceTheme.muted)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let error = controller.errorMessage {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(PaceTheme.coral)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(12)
