@@ -8,7 +8,7 @@ let homeURL = FileManager.default.homeDirectoryForCurrentUser
 
 enum ProductIdentity {
     static let displayName = "Pace"
-    static var subtitleLocal: String { LocalMode.isCodexOnly ? "Codex usage monitor" : "AI pace monitor" }
+    static var subtitleLocal: String { LocalMode.isCodexOnly ? "Codex pace and session control" : "AI pace and session control" }
     static let subtitleAppStore = "Snapshot monitor"
     static let legacyICloudFolderName = "Pace"
     static let installedAppPath = "/Applications/Pace.app"
@@ -306,6 +306,36 @@ struct QuotaReading: Identifiable {
         return (usedPercent / 100) / elapsed
     }
 
+    // When usage is ahead of elapsed time, turn the abstract pace multiple
+    // into the decision the user actually needs: roughly how early the meter
+    // would be exhausted if the current pace held.
+    var projectedCapLeadText: String? {
+        guard let usedPercent,
+              usedPercent >= 5,
+              let resetAt,
+              let windowDuration,
+              let elapsedFraction = windowElapsedFraction,
+              elapsedFraction > 0.01,
+              let paceRatio,
+              paceRatio > 1 else { return nil }
+        let elapsed = windowDuration * elapsedFraction
+        let projectedTotal = elapsed / (usedPercent / 100)
+        let projectedRemaining = max(0, projectedTotal - elapsed)
+        let resetRemaining = max(0, resetAt.timeIntervalSince(Date()))
+        let lead = resetRemaining - projectedRemaining
+        guard lead >= 15 * 60 else { return nil }
+        return compactDuration(lead)
+    }
+
+    private func compactDuration(_ seconds: TimeInterval) -> String {
+        let minutes = max(0, Int(seconds / 60))
+        let days = minutes / (24 * 60)
+        let hours = (minutes % (24 * 60)) / 60
+        if days > 0 { return hours > 0 ? "\(days)d \(hours)h" : "\(days)d" }
+        if hours > 0 { return "\(hours)h \(minutes % 60)m" }
+        return "\(minutes)m"
+    }
+
     var paceText: String {
         if isOnFumes { return "on fumes · still serving" }
         if limitReached == true, (remainingPercent ?? 100) <= 1 { return "capped" }
@@ -400,6 +430,8 @@ struct SessionInsight {
     let workedOn: String
     let produced: String
     let wasted: String
+    let status: String
+    let nextStep: String
     let usefulPercent: Int?
 }
 
@@ -443,6 +475,8 @@ enum SessionInsightStore {
                 workedOn: str("worked_on"),
                 produced: str("produced"),
                 wasted: str("wasted"),
+                status: str("status"),
+                nextStep: str("next_step"),
                 usefulPercent: pct
             )
         }
@@ -609,6 +643,44 @@ struct ResetCredit {
     var resolvedAt: Date? = nil
 }
 
+enum QuotaWindowClassifier {
+    private enum Kind: Equatable { case fiveHour, weekly }
+
+    // The API's field positions are not semantic. It can now return a seven-day
+    // meter in `primary` with no `secondary`, so classify by duration and use
+    // the legacy field roles only when a feed has no duration at all.
+    static func canonical(
+        primary: [String: Any]?,
+        secondary: [String: Any]?
+    ) -> (fiveHour: [String: Any]?, weekly: [String: Any]?) {
+        let primary = primary.flatMap(hasReading)
+        let secondary = secondary.flatMap(hasReading)
+        let candidates = [primary, secondary].compactMap { $0 }
+
+        var fiveHour = candidates.first { kind(of: $0) == .fiveHour }
+        var weekly = candidates.first { kind(of: $0) == .weekly }
+        if fiveHour == nil, let primary, kind(of: primary) == nil {
+            fiveHour = primary
+        }
+        if weekly == nil, let secondary, kind(of: secondary) == nil {
+            weekly = secondary
+        }
+        return (fiveHour, weekly)
+    }
+
+    private static func hasReading(_ window: [String: Any]) -> [String: Any]? {
+        let hasValue = number(window["used_percent"]) != nil
+            || number(window["window_minutes"]) != nil
+            || DateParsers.any(window["resets_at"]) != nil
+        return hasValue ? window : nil
+    }
+
+    private static func kind(of window: [String: Any]) -> Kind? {
+        guard let minutes = number(window["window_minutes"]), minutes > 0 else { return nil }
+        return minutes < 24 * 60 ? .fiveHour : .weekly
+    }
+}
+
 enum QuotaReader {
     static func read(engine: String, relativePath: String, weeklyKey: String) -> [QuotaReading] {
         read(engine: engine, feedURL: homeURL.appendingPathComponent(relativePath), weeklyKey: weeklyKey)
@@ -630,20 +702,26 @@ enum QuotaReader {
         let sourceReadingAt = DateParsers.any(object["source_reading_at"])
             ?? DateParsers.any(object["source_event_ts"])
             ?? updatedAt
-        let primary = quotaWindow(
+        let primaryCandidate = quotaWindow(
             object,
             nestedKey: "primary",
             usedKey: "five_hour_used_pct",
             resetKey: "five_hour_resets_at_unix",
             windowKey: "five_hour_window_minutes"
         )
-        let weekly = quotaWindow(
+        let weeklyCandidate = quotaWindow(
             object,
             nestedKey: weeklyKey,
             usedKey: "weekly_used_pct",
             resetKey: "weekly_resets_at_unix",
             windowKey: "weekly_window_minutes"
         )
+        let windows = QuotaWindowClassifier.canonical(
+            primary: primaryCandidate,
+            secondary: weeklyCandidate
+        )
+        let primary = windows.fiveHour ?? [:]
+        let weekly = windows.weekly ?? [:]
 
         return [
             QuotaReading(
@@ -825,16 +903,24 @@ enum NativeUsagePoller {
         out["plan_type"] = usage["plan_type"]
         out["account_email"] = usage["email"]
         out["account_id"] = usage["account_id"]
-        if let window = windowDict(rate["primary_window"]) { out["primary"] = window }
-        if let window = windowDict(rate["secondary_window"]) { out["secondary"] = window }
+        let windows = QuotaWindowClassifier.canonical(
+            primary: windowDict(rate["primary_window"]),
+            secondary: windowDict(rate["secondary_window"])
+        )
+        if let window = windows.fiveHour { out["primary"] = window }
+        if let window = windows.weekly { out["secondary"] = window }
         var pools: [[String: Any]] = []
-        if var main = windowDict(rate["secondary_window"]) {
+        if var main = windows.weekly {
             main["name"] = "Codex"
             pools.append(main)
         }
         for extra in (usage["additional_rate_limits"] as? [[String: Any]]) ?? [] {
             let name = (extra["limit_name"] as? String) ?? (extra["metered_feature"] as? String) ?? "Codex"
-            if let sub = extra["rate_limit"] as? [String: Any], var window = windowDict(sub["secondary_window"]) {
+            if let sub = extra["rate_limit"] as? [String: Any],
+               var window = QuotaWindowClassifier.canonical(
+                   primary: windowDict(sub["primary_window"]),
+                   secondary: windowDict(sub["secondary_window"])
+               ).weekly {
                 window["name"] = name
                 pools.append(window)
             }
@@ -1226,6 +1312,11 @@ enum BurnRateReader {
                 let tokens = int(lastUsage?["total_tokens"] ?? totalUsage?["total_tokens"])
                 let rateLimits = payload["rate_limits"] as? [String: Any]
                 let primary = rateLimits?["primary"] as? [String: Any]
+                let secondary = rateLimits?["secondary"] as? [String: Any]
+                let fiveHour = QuotaWindowClassifier.canonical(
+                    primary: primary,
+                    secondary: secondary
+                ).fiveHour
                 let reached: Bool? = rateLimits.map { limits in
                     guard let value = limits["rate_limit_reached_type"], !(value is NSNull) else { return false }
                     return true
@@ -1233,7 +1324,9 @@ enum BurnRateReader {
                 return BurnEvent(
                     engine: "Codex",
                     tokens: tokens,
-                    quotaUsedPercent: number(primary?["used_percent"]),
+                    // A weekly-only payload must never drive the short-window
+                    // cap ETA. Token throughput remains useful without it.
+                    quotaUsedPercent: number(fiveHour?["used_percent"]),
                     timestamp: timestamp,
                     session: file.path,
                     rateLimitReached: reached
@@ -1444,6 +1537,7 @@ enum SessionReader {
         var explicitTitle: String?
         var fallbackTitle: String?
         var done = false
+        var isSubagent = false
 
         for line in lines {
             guard
@@ -1459,6 +1553,11 @@ enum SessionReader {
                 fallbackTitle = fallbackTitle ?? lastPrompt
             }
             if let payload = object["payload"] as? [String: Any] {
+                if (object["type"] as? String) == "session_meta",
+                   let metaSource = payload["source"] as? [String: Any],
+                   metaSource["subagent"] != nil {
+                    isSubagent = true
+                }
                 cwd = (payload["cwd"] as? String) ?? cwd
                 model = (payload["model"] as? String) ?? model
                 if (payload["type"] as? String) == "user_message",
@@ -1512,6 +1611,11 @@ enum SessionReader {
             }
             if (object["type"] as? String) == "result" { done = true }
         }
+
+        // Review/guardian/worker rollouts are implementation detail, not
+        // separate pieces of Amit's work. Showing them duplicates the parent
+        // task and can attach a review verdict to the wrong project.
+        if isSubagent { return nil }
 
         let workspace = workspaceName(cwd: cwd, file: url)
         let title = explicitTitle ?? fallbackTitle ?? workspace
@@ -1971,6 +2075,7 @@ final class PaceStore: ObservableObject {
     @Published var snapshot = PaceSnapshot.collect(statusOnly: LocalMode.isCodexOnly)
     @Published var insights: [String: SessionInsight] = SessionInsightStore.load()
     @Published var summarising: Set<String> = []
+    let seshControl = SeshControlController(backend: SeshControlBackend())
     private var isRefreshing = false
 
     func insight(for session: SessionReading) -> SessionInsight? {
@@ -2239,24 +2344,39 @@ enum StatusBarText {
         let detailStyle: DetailStyle
     }
 
+    // Weekly capacity is the durable planning number Amit wants at a glance.
+    // A five-hour meter, when the account publishes one, remains a secondary
+    // pressure signal and can still colour or annotate the headline.
+    static func headlineQuota(for snapshot: PaceSnapshot) -> QuotaReading? {
+        let codex = snapshot.quotas.filter { $0.engine == "Codex" && $0.usedPercent != nil }
+        return codex.first(where: { $0.window == "week" })
+            ?? codex.first(where: { $0.window == "5h" })
+    }
+
     static func codexTitleParts(for snapshot: PaceSnapshot) -> CodexTitleParts? {
-        guard let quota = snapshot.quotas.first(where: { $0.engine == "Codex" && $0.window == "5h" }),
+        guard let quota = headlineQuota(for: snapshot),
               let remainingPercent = quota.remainingPercent else {
             return nil
         }
         let burn = snapshot.burnRates.first { $0.engine == "Codex" }
-        let pct = "\(Int(remainingPercent.rounded()))%"
+        let pct = "\(Int(remainingPercent.rounded()))% \(quota.window == "week" ? "wk" : "5h")"
         let levels = burn?.barSparkLevels ?? []
+        let fiveHour = snapshot.quotas.first {
+            $0.engine == "Codex" && $0.window == "5h" && $0.usedPercent != nil
+        }
         // Cap ETA outranks reset text, but only when it is the binding
         // constraint: live drain, hitting within 2h, and before the reset
         // would grant relief anyway.
-        if let capText = capText(quota: quota, burn: burn) {
-            return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: capText, detailStyle: .urgent)
+        if let fiveHour, let capText = capText(quota: fiveHour, burn: burn) {
+            return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: "5h \(capText)", detailStyle: .urgent)
         }
         // Meter exhausted but the server is still landing requests: say so
         // instead of showing a dead 0%.
-        if quota.isOnFumes {
-            return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: quota.resetText, detailStyle: .fumes)
+        if let fiveHour, fiveHour.isOnFumes {
+            return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: "5h \(fiveHour.resetText)", detailStyle: .fumes)
+        }
+        if let fiveHourRemaining = fiveHour?.remainingPercent, fiveHourRemaining <= 30 {
+            return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: "5h \(Int(fiveHourRemaining.rounded()))%", detailStyle: .ambient)
         }
         if remainingPercent <= 30 {
             return CodexTitleParts(sparkLevels: levels, percentText: pct, detailText: quota.resetText, detailStyle: .ambient)
@@ -2268,7 +2388,19 @@ enum StatusBarText {
         // Softer palette: neutral monochrome at rest, green only while
         // tokens are actually flowing, amber/red reserved for pressure.
         let burnLive = snapshot.burnRates.first { $0.engine == "Codex" }?.freshness == "live"
-        switch snapshot.quotas.first(where: { $0.engine == "Codex" && $0.window == "5h" })?.paceState {
+        let short = snapshot.quotas.first {
+            $0.engine == "Codex" && $0.window == "5h" && $0.usedPercent != nil
+        }
+        let pressureQuota: QuotaReading?
+        if let short {
+            switch short.paceState {
+            case .hot, .critical, .fumes: pressureQuota = short
+            default: pressureQuota = headlineQuota(for: snapshot)
+            }
+        } else {
+            pressureQuota = headlineQuota(for: snapshot)
+        }
+        switch pressureQuota?.paceState {
         case .good: return burnLive ? .systemGreen : .labelColor
         case .hot: return .systemOrange
         case .fumes: return .systemOrange
@@ -2321,7 +2453,8 @@ enum StatusBarText {
     }
 
     static func capText(quota: QuotaReading, burn: BurnReading?) -> String? {
-        guard let burn, burn.freshness == "live", let capMinutes = burn.capMinutes, capMinutes < 120 else { return nil }
+        guard quota.window == "5h",
+              let burn, burn.freshness == "live", let capMinutes = burn.capMinutes, capMinutes < 120 else { return nil }
         if let resetAt = quota.resetAt {
             let resetMinutes = max(0, resetAt.timeIntervalSince(Date()) / 60)
             guard capMinutes < resetMinutes else { return nil }
@@ -2336,8 +2469,12 @@ enum StatusBarText {
     static func codexTooltip(for snapshot: PaceSnapshot) -> String {
         let fiveHour = snapshot.quotas.first { $0.engine == "Codex" && $0.window == "5h" }
         let weekly = snapshot.quotas.first { $0.engine == "Codex" && $0.window == "week" }
-        let fiveHourText = fiveHour.map { "\($0.remainingPercentText), \($0.usedPercentText), \($0.paceText), \($0.sinceResetText) since reset, resets \($0.resetDetailText)" } ?? "5h unknown"
-        let weeklyText = weekly.map { "\($0.remainingPercentText), \($0.usedPercentText), \($0.paceText), \($0.sinceResetText) since reset, resets \($0.resetDetailText)" } ?? "week unknown"
+        let fiveHourText = fiveHour.flatMap { $0.usedPercent == nil ? nil : $0 }
+            .map { "\($0.remainingPercentText), \($0.usedPercentText), \($0.paceText), \($0.sinceResetText) since reset, resets \($0.resetDetailText)" }
+            ?? "not reported by this account"
+        let weeklyText = weekly.flatMap { $0.usedPercent == nil ? nil : $0 }
+            .map { "\($0.remainingPercentText), \($0.usedPercentText), \($0.paceText), \($0.sinceResetText) since reset, resets \($0.resetDetailText)" }
+            ?? "not reported by this account"
         let resetAllowance = resetAllowanceText(for: snapshot)
         let paceLine: String
         if let burn = snapshot.burnRates.first(where: { $0.engine == "Codex" }), burn.tokensPerMinute > 0, burn.freshness != "idle" {
@@ -2383,6 +2520,7 @@ struct PacePanelView: View {
             Picker("", selection: $tab) {
                 Text("Now").tag("Now")
                 Text("Sessions").tag("Sessions")
+                Text("Hours").tag("Hours")
                 if !LocalMode.isCodexOnly {
                     Text("System").tag("System")
                 }
@@ -2397,6 +2535,8 @@ struct PacePanelView: View {
                 switch tab {
                 case "Sessions":
                     sessionsView
+                case "Hours":
+                    hourlyView
                 case "System":
                     systemView
                 default:
@@ -2405,6 +2545,7 @@ struct PacePanelView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(PaceTheme.panel)
+            .foregroundStyle(.white)
         }
         .frame(width: 480, height: 520)
         .background(PaceTheme.panel)
@@ -2545,29 +2686,38 @@ struct PacePanelView: View {
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
     }
 
+    private var hourlyView: some View {
+        HourlyUsageView(includeClaude: !LocalMode.isCodexOnly)
+    }
+
     private var nowView: some View {
         VStack(alignment: .leading, spacing: 10) {
             if needsOnboarding {
                 onboardingCard
             }
-            thrustHero
-            section("Usage") {
-                quotaList
-                if store.snapshot.codexResetsAvailable != nil {
-                    bankedResetRow
+            if !DistributionMode.isAppStore {
+                SeshControlCard(controller: store.seshControl)
+            }
+            capacityHero
+            if !supplementalQuotas.isEmpty {
+                section("Other limits") {
+                    supplementalQuotaList
                 }
+            }
+            if store.snapshot.codexResetsAvailable != nil {
+                bankedResetSummaryRow
             }
             if !LocalMode.isCodexOnly {
                 burnStrip
             }
-            activeSessionHighlights
-            sourceBanner
-            section("Alerts") {
-                if store.snapshot.alerts.isEmpty {
-                    row("Clear", detail: LocalMode.isCodexOnly ? "No active Codex alerts" : "No active Pace alerts", icon: "checkmark.circle", accent: PaceTheme.green)
-                } else {
+            recentWorkHighlights
+            if shouldShowSourceBanner {
+                sourceBanner
+            }
+            if !store.snapshot.alerts.isEmpty {
+                section("Needs attention") {
                     ForEach(store.snapshot.alerts, id: \.self) { alert in
-                        row(alert, detail: "Needs attention", icon: "exclamationmark.triangle", accent: PaceTheme.amber)
+                        row(alert, detail: "Action may be needed", icon: "exclamationmark.triangle", accent: PaceTheme.amber)
                     }
                 }
             }
@@ -2579,92 +2729,118 @@ struct PacePanelView: View {
             }
         }
         .padding(14)
+        .foregroundStyle(.white)
     }
 
-    // The hero speaks the same language as the menu bar: drawn thrust bars,
-    // one big number, and the cap ETA line when it is the binding constraint.
-    @ViewBuilder
-    private var thrustHero: some View {
-        let burn = store.snapshot.burnRates.sorted { $0.tokensPerMinute > $1.tokensPerMinute }.first
-        let quota = store.snapshot.quotas.first { $0.engine == (burn?.engine ?? "Codex") && $0.window == "5h" }
-        let live = burn.map { $0.freshness == "live" || $0.freshness == "fresh" } ?? false
-        let accent: Color = live ? (burn.map(burnAccent) ?? PaceTheme.green) : PaceTheme.muted
-        let cap = quota.flatMap { StatusBarText.capText(quota: $0, burn: burn) }
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(live ? (burn?.tokensPerMinuteText ?? "idle") : "Idle")
-                    .font(.system(size: 24, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(live ? Color.white : PaceTheme.muted)
-                if live, let burn {
-                    Text(burn.freshness)
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(accent.opacity(0.18), in: Capsule())
+    // Lead with a decision, not telemetry. Token flow is evidence; capacity and
+    // whether work can continue are what the user actually needs to know.
+    private var capacityHero: some View {
+        let quota = StatusBarText.headlineQuota(for: store.snapshot)
+        let accent = quota.map(quotaAccent) ?? PaceTheme.muted
+        let burn = store.snapshot.burnRates.first { $0.engine == "Codex" }
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Capacity now")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(PaceTheme.muted)
+                    .textCase(.uppercase)
+                Spacer()
+                if let quota {
+                    Text(quota.window == "week" ? "Weekly" : "5-hour")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(accent.opacity(0.16), in: Capsule())
                         .foregroundStyle(accent)
                 }
-                Spacer()
-                if let remaining = quota?.remainingPercent {
-                    Text("\(Int(remaining.rounded()))% left")
-                        .font(.system(size: 12, weight: .semibold))
+            }
+            if let quota {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(capacityHeadline(quota))
+                        .font(.system(size: 24, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Text(quota.remainingPercentText)
+                        .font(.system(size: 17, weight: .bold, design: .monospaced))
                         .monospacedDigit()
+                        .foregroundStyle(accent)
+                }
+                Text(capacityRecommendation(quota))
+                    .font(.system(size: 13, weight: .medium))
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(capacityEvidence(quota))
+                    .font(.caption2)
+                    .foregroundStyle(PaceTheme.muted)
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.08))
+                    Capsule().fill(accent)
+                        .frame(maxWidth: .infinity)
+                        .scaleEffect(x: CGFloat((quota.remainingPercent ?? 0) / 100), anchor: .leading)
+                }
+                .frame(height: 6)
+                if quota.window == "week" && !hasPublishedFiveHourQuota {
+                    Text("The account is publishing a weekly meter only; Pace will not relabel it as 5h.")
+                        .font(.caption2)
                         .foregroundStyle(PaceTheme.muted)
                 }
+            } else {
+                Text("Waiting for a quota reading")
+                    .font(.system(size: 22, weight: .bold, design: .rounded))
+                Text("Pace has session activity but no correctly classified capacity window yet.")
+                    .font(.caption)
+                    .foregroundStyle(PaceTheme.muted)
             }
-            thrustBars(burn: burn, accent: accent)
-            HStack(spacing: 5) {
-                if cap != nil {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 9))
-                }
-                Text(heroFooter(burn: burn, quota: quota, live: live, cap: cap))
-                    .lineLimit(1)
+            if let burn, burn.activeSessions > 0 {
+                Label("\(burn.activeSessions) active session\(burn.activeSessions == 1 ? "" : "s") now", systemImage: "waveform.path.ecg")
+                    .font(.caption2)
+                    .foregroundStyle(PaceTheme.teal)
             }
-            .font(.caption2)
-            .foregroundStyle(cap != nil ? PaceTheme.amber : PaceTheme.muted)
         }
         .padding(12)
         .background(cardFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(accent.opacity(0.28)))
     }
 
-    private func heroFooter(burn: BurnReading?, quota: QuotaReading?, live: Bool, cap: String?) -> String {
-        let resets = quota.map { "resets \($0.resetDetailText)" }
-        if let cap {
-            return (["At this pace: empty in \(cap)", resets] .compactMap { $0 }).joined(separator: " · ")
+    private var hasPublishedFiveHourQuota: Bool {
+        store.snapshot.quotas.contains {
+            $0.engine == "Codex" && $0.window == "5h" && $0.usedPercent != nil
         }
-        if let burn, live {
-            let sessions = "\(burn.activeSessions) session\(burn.activeSessions == 1 ? "" : "s")"
-            return (["\(burn.tokensText) over \(burn.windowDurationText)", sessions, resets].compactMap { $0 }).joined(separator: " · ")
-        }
-        if let last = burn?.lastEventAt {
-            return (["Last activity \(relativeTime(last))", resets].compactMap { $0 }).joined(separator: " · ")
-        }
-        return (["No recent activity", resets].compactMap { $0 }).joined(separator: " · ")
     }
 
-    private func thrustBars(burn: BurnReading?, accent: Color) -> some View {
-        let points = burn?.points ?? []
-        let peak = max(points.map(\.tokensPerMinute).max() ?? 0, 1)
-        return HStack(alignment: .bottom, spacing: 6) {
-            if points.isEmpty {
-                ForEach(0..<12, id: \.self) { _ in
-                    RoundedRectangle(cornerRadius: 2, style: .continuous)
-                        .fill(PaceTheme.muted.opacity(0.18))
-                        .frame(height: 3)
-                        .frame(maxWidth: .infinity)
-                }
-            } else {
-                ForEach(Array(points.enumerated()), id: \.offset) { index, point in
-                    RoundedRectangle(cornerRadius: 2, style: .continuous)
-                        .fill(accent.opacity(index == points.count - 1 ? 1.0 : 0.25 + 0.6 * Double(index) / Double(max(1, points.count - 1))))
-                        .frame(height: max(3, 44 * point.tokensPerMinute / peak))
-                        .frame(maxWidth: .infinity)
-                }
+    private func capacityHeadline(_ quota: QuotaReading) -> String {
+        switch quota.paceState {
+        case .critical: return "Capacity at risk"
+        case .hot: return "Using faster than plan"
+        case .fumes: return "Still serving"
+        case .good:
+            return (quota.remainingPercent ?? 0) >= 50 ? "Comfortable" : "On track"
+        case .unknown: return "Reading available"
+        }
+    }
+
+    private func capacityRecommendation(_ quota: QuotaReading) -> String {
+        switch quota.paceState {
+        case .critical:
+            return quota.window == "5h"
+                ? "Prioritise the current task; short-term capacity may run out before reset."
+                : "Weekly capacity may run out before reset; prioritise the work that matters."
+        case .hot:
+            if let lead = quota.projectedCapLeadText {
+                return "If this pace holds, capacity reaches 100% about \(lead) before reset."
             }
+            return "Usage is ahead of elapsed time in this window; keep an eye on remaining capacity."
+        case .fumes:
+            return "Requests are still landing, but there is almost no measured short-term headroom."
+        case .good:
+            return "You can keep working normally; this pool is tracking to last until reset."
+        case .unknown:
+            return "Pace has the meter but not enough timing evidence for a forecast yet."
         }
-        .frame(height: 44, alignment: .bottom)
+    }
+
+    private func capacityEvidence(_ quota: QuotaReading) -> String {
+        let window = quota.window == "week" ? "the week" : "the 5-hour window"
+        return "\(quota.usedPercentText) · \(quota.sinceResetText) into \(window) · resets in \(quota.resetText)"
     }
 
     // The live burn, as a compact strip rather than a graph: the sparkline did
@@ -2713,14 +2889,88 @@ struct PacePanelView: View {
     }
 
     @ViewBuilder
-    private var activeSessionHighlights: some View {
-        let active = store.snapshot.sessions.filter { $0.status == "running" }
-        if !active.isEmpty {
-            section("Active") {
-                ForEach(Array(active.prefix(3))) { session in
-                    compactSessionRow(session)
+    private var recentWorkHighlights: some View {
+        let recent = Array(store.snapshot.sessions.prefix(3))
+        if !recent.isEmpty {
+            section("Recent work") {
+                ForEach(recent) { session in
+                    workHighlightRow(session)
                 }
             }
+        }
+    }
+
+    private func workHighlightRow(_ session: SessionReading) -> some View {
+        let insight = store.insight(for: session)
+        let status = workStatus(session, insight: insight)
+        let accent = workStatusAccent(status)
+        let outcome = insight.flatMap { value in
+            if !value.produced.isEmpty { return value.produced }
+            if !value.workedOn.isEmpty { return value.workedOn }
+            return nil
+        }
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: workStatusIcon(status))
+                    .foregroundStyle(accent)
+                    .frame(width: 18)
+                Text(sessionLabel(session, insight))
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                Spacer()
+                Text(status)
+                    .font(.system(size: 9, weight: .bold))
+                    .textCase(.uppercase)
+                    .foregroundStyle(accent)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(accent.opacity(0.14), in: Capsule())
+            }
+            Text(outcome ?? sessionDetail(session))
+                .font(.caption2)
+                .foregroundStyle(PaceTheme.muted)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            if let next = insight?.nextStep, !next.isEmpty {
+                Label("Next: \(next)", systemImage: "arrow.right.circle")
+                    .font(.caption2)
+                    .foregroundStyle(PaceTheme.blue)
+                    .lineLimit(2)
+            } else if insight == nil && session.status != "running" {
+                Text("Outcome analysis pending")
+                    .font(.caption2)
+                    .foregroundStyle(PaceTheme.muted.opacity(0.78))
+            }
+        }
+        .padding(10)
+        .background(cardFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(accent.opacity(0.16)))
+    }
+
+    private func workStatus(_ session: SessionReading, insight: SessionInsight?) -> String {
+        if session.status == "running" { return "active" }
+        let status = insight?.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return status.isEmpty ? session.status : status
+    }
+
+    private func workStatusAccent(_ status: String) -> Color {
+        switch status {
+        case "done", "complete", "completed": return PaceTheme.green
+        case "blocked": return PaceTheme.coral
+        case "partial", "waiting": return PaceTheme.amber
+        case "active", "running": return PaceTheme.teal
+        default: return PaceTheme.muted
+        }
+    }
+
+    private func workStatusIcon(_ status: String) -> String {
+        switch status {
+        case "done", "complete", "completed": return "checkmark.circle"
+        case "blocked": return "xmark.octagon"
+        case "partial": return "circle.lefthalf.filled"
+        case "waiting": return "pause.circle"
+        case "active", "running": return "waveform.path.ecg"
+        default: return "questionmark.circle"
         }
     }
 
@@ -2744,6 +2994,12 @@ struct PacePanelView: View {
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
     }
 
+    private var shouldShowSourceBanner: Bool {
+        store.snapshot.sourceIsSample || store.snapshot.quotas.contains {
+            $0.usedPercent != nil && ["lagging", "stale", "missing"].contains($0.freshness)
+        }
+    }
+
     private var sourceDetail: String {
         if let generatedAt = store.snapshot.sourceGeneratedAt {
             return "generated \(relativeTime(generatedAt)) · \(store.snapshot.sourceKind)"
@@ -2751,9 +3007,15 @@ struct PacePanelView: View {
         return "\(store.snapshot.sourceKind) · generated time unknown"
     }
 
-    private var quotaList: some View {
+    private var supplementalQuotas: [QuotaReading] {
+        let known = store.snapshot.quotas.filter { $0.usedPercent != nil }
+        guard let headline = StatusBarText.headlineQuota(for: store.snapshot) else { return known }
+        return known.filter { $0.id != headline.id }
+    }
+
+    private var supplementalQuotaList: some View {
         VStack(spacing: 8) {
-            ForEach(store.snapshot.quotas.sorted(by: quotaSort)) { quota in
+            ForEach(supplementalQuotas.sorted(by: quotaSort)) { quota in
                 quotaRow(quota)
             }
         }
@@ -3094,8 +3356,8 @@ struct PacePanelView: View {
                 }
             }
             section("History") {
-                row("24h", detail: "\(store.snapshot.history.sessions24h) sessions, \(formattedTokens(store.snapshot.history.tokens24h)) estimated tokens", icon: "clock", accent: PaceTheme.teal)
-                row("7d", detail: "\(store.snapshot.history.sessions7d) sessions, \(formattedTokens(store.snapshot.history.tokens7d)) estimated tokens", icon: "calendar", accent: PaceTheme.blue)
+                row("24h", detail: "\(store.snapshot.history.sessions24h) user work sessions", icon: "clock", accent: PaceTheme.teal)
+                row("7d", detail: "\(store.snapshot.history.sessions7d) user work sessions", icon: "calendar", accent: PaceTheme.blue)
             }
         }
         .padding(18)
@@ -3186,14 +3448,7 @@ struct PacePanelView: View {
                         .font(.caption2)
                         .foregroundStyle(PaceTheme.muted)
                 }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(sessionTokenText(session))
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                    Text(session.tokenBasis)
-                        .font(.caption2)
-                        .foregroundStyle(PaceTheme.muted)
-                }
+                Spacer(minLength: 0)
             }
             sessionInsightBlock(session, insight: insight)
         }
@@ -3206,24 +3461,27 @@ struct PacePanelView: View {
     private func sessionInsightBlock(_ session: SessionReading, insight: SessionInsight?) -> some View {
         if let insight = insight {
             VStack(alignment: .leading, spacing: 4) {
+                if !insight.status.isEmpty {
+                    let status = insight.status.lowercased()
+                    Text(status)
+                        .font(.system(size: 9, weight: .bold))
+                        .textCase(.uppercase)
+                        .foregroundStyle(workStatusAccent(status))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(workStatusAccent(status).opacity(0.14), in: Capsule())
+                }
+                if !insight.workedOn.isEmpty {
+                    insightLine(icon: "scope", text: insight.workedOn, accent: PaceTheme.blue)
+                }
                 if !insight.produced.isEmpty {
                     insightLine(icon: "checkmark.seal", text: insight.produced, accent: PaceTheme.green)
                 }
+                if !insight.nextStep.isEmpty {
+                    insightLine(icon: "arrow.right.circle", text: "Next: \(insight.nextStep)", accent: PaceTheme.blue)
+                }
                 if !insight.wasted.isEmpty && insight.wasted.lowercased() != "no obvious waste" {
                     insightLine(icon: "exclamationmark.triangle", text: insight.wasted, accent: PaceTheme.amber)
-                }
-                if let pct = insight.usefulPercent {
-                    HStack(spacing: 6) {
-                        Text("Useful")
-                            .font(.caption2)
-                            .foregroundStyle(PaceTheme.muted)
-                        ProgressView(value: Double(max(0, min(100, pct))) / 100.0)
-                            .frame(maxWidth: 90)
-                            .tint(usefulAccent(pct))
-                        Text("\(pct)%")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundStyle(usefulAccent(pct))
-                    }
                 }
             }
             .padding(.leading, 44)
@@ -3268,14 +3526,22 @@ struct PacePanelView: View {
         return PaceTheme.coral
     }
 
-    // What to show as the session's headline. Prefer the brain-style tag from the
-    // summariser; if it has not run yet, fall back to the project folder, never
-    // the raw prompt the user typed (which reads as noise in a list).
+    // Prefer the brain-style tag from the summariser. While a live session has
+    // not settled long enough to summarise, a short task phrase is still more
+    // useful than three identical "Working…" rows.
     private func sessionLabel(_ session: SessionReading, _ insight: SessionInsight?) -> String {
         if let tag = insight?.oneLine, !tag.isEmpty { return tag }
         let workspace = session.workspace.trimmingCharacters(in: .whitespaces)
         if !workspace.isEmpty, !["home", "workspace", "unknown"].contains(workspace.lowercased()) {
             return workspace
+        }
+        let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !title.isEmpty, !["home", "workspace", "unknown"].contains(title.lowercased()),
+           !title.lowercased().hasPrefix("you are ") {
+            let sentence = title.prefix(1).uppercased() + String(title.dropFirst())
+            if sentence.count <= 54 { return sentence }
+            let end = sentence.index(sentence.startIndex, offsetBy: 51)
+            return String(sentence[..<end]).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
         }
         return session.status == "running" ? "Working…" : "Codex session"
     }
@@ -3295,10 +3561,7 @@ struct PacePanelView: View {
                     .foregroundStyle(PaceTheme.muted)
                     .lineLimit(1)
             }
-            Spacer()
-            Text(sessionTokenText(session))
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.92))
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -3356,16 +3619,6 @@ struct PacePanelView: View {
         return "\(seconds / 86400)d ago"
     }
 
-    private func formattedTokens(_ count: Int) -> String {
-        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
-        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1_000) }
-        return "\(count)"
-    }
-
-    private func sessionTokenText(_ session: SessionReading) -> String {
-        session.tokens > 0 ? formattedTokens(session.tokens) : "pending"
-    }
-
     private func displayCwd(_ cwd: String) -> String {
         let trimmed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != "unknown" else { return "cwd unknown" }
@@ -3384,10 +3637,12 @@ struct PacePanelView: View {
     }
 
     private func quotaBrief(for engine: String) -> String {
-        guard let quota = store.snapshot.quotas.first(where: { $0.engine == engine && $0.window == "5h" }) else {
+        let available = store.snapshot.quotas.filter { $0.engine == engine && $0.usedPercent != nil }
+        guard let quota = available.first(where: { $0.window == "week" })
+            ?? available.first(where: { $0.window == "5h" }) else {
             return "quota unknown"
         }
-        return "\(quota.remainingPercentText) · resets \(quota.resetDetailText)"
+        return "\(quota.remainingPercentText) \(quota.window == "week" ? "weekly" : "5h") · resets \(quota.resetDetailText)"
     }
 }
 
@@ -3550,6 +3805,320 @@ struct PaceGraphView: View {
     }
 }
 
+// MARK: - Hourly usage ("when do I burn tokens")
+
+// Token totals bucketed by hour of day (local time) over a recent window, read
+// from the same Codex/Claude session logs Pace already ingests. Answers "when
+// do I use the most tokens" - the time-of-day pattern the live 15-minute burn
+// graph cannot show. Self-contained (own file walk + parse) so it never touches
+// the live poller path.
+struct HourlyUsage: Sendable {
+    var codex: [Int]   // 24 buckets, hour 0...23
+    var claude: [Int]  // 24 buckets
+    var days: Int
+    var lastUpdated: Date
+
+    static let empty = HourlyUsage(codex: Array(repeating: 0, count: 24),
+                                   claude: Array(repeating: 0, count: 24),
+                                   days: 0, lastUpdated: .distantPast)
+
+    var total: Int { codex.reduce(0, +) + claude.reduce(0, +) }
+    var hourTotals: [Int] { (0..<24).map { codex[$0] + claude[$0] } }
+    var peakHour: Int? {
+        let totals = hourTotals
+        guard let peak = totals.max(), peak > 0 else { return nil }
+        return totals.firstIndex(of: peak)
+    }
+
+    // Busiest 3-hour window and its share of activity. A ratio, so it stays
+    // meaningful even when only a recent sample of sessions has been read.
+    var peakWindow: (start: Int, share: Double)? {
+        let totals = hourTotals
+        let grand = totals.reduce(0, +)
+        guard grand > 0 else { return nil }
+        var bestStart = 0
+        var bestSum = -1
+        for start in 0..<24 {
+            let sum = (0..<3).reduce(0) { $0 + totals[(start + $1) % 24] }
+            if sum > bestSum { bestSum = sum; bestStart = start }
+        }
+        return (bestStart, Double(bestSum) / Double(grand))
+    }
+}
+
+enum HourlyUsageReader {
+    nonisolated(unsafe) private static var cache: HourlyUsage?
+    private static let cacheLock = NSLock()
+    private static let cacheTTL: TimeInterval = 300
+
+    private static func cached(days: Int) -> HourlyUsage? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        if let cache, cache.days == days, Date().timeIntervalSince(cache.lastUpdated) < cacheTTL {
+            return cache
+        }
+        return nil
+    }
+
+    // Heavy file IO; call off the main actor.
+    static func load(days: Int, includeClaude: Bool) -> HourlyUsage {
+        if let hit = cached(days: days) { return hit }
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-Double(days) * 86400)
+        let fileCutoff = cutoff.addingTimeInterval(-2 * 86400) // archived mtime slack
+        var codex = Array(repeating: 0, count: 24)
+        var claude = Array(repeating: 0, count: 24)
+        let calendar = Calendar.current
+        let home = FileManager.default.homeDirectoryForCurrentUser
+
+        // Formatters are created once here and used only on this thread, so no
+        // shared non-Sendable state escapes across the actor boundary.
+        let isoFractional = ISO8601DateFormatter()
+        isoFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoPlain = ISO8601DateFormatter()
+        isoPlain.formatOptions = [.withInternetDateTime]
+        func parseDate(_ value: Any?) -> Date? {
+            guard let s = value as? String else { return nil }
+            return isoFractional.date(from: s) ?? isoPlain.date(from: s)
+        }
+        func bucket(_ date: Date, into buckets: inout [Int], tokens: Int) {
+            guard date >= cutoff, tokens > 0 else { return }
+            let hour = calendar.component(.hour, from: date)
+            if hour >= 0, hour < 24 { buckets[hour] += tokens }
+        }
+
+        // Codex: live + archived rollouts. Bounded on both axes - most-recent
+        // files, and a byte prefix per file - so a fortnight of history (which
+        // can run to several GB, with the odd 200MB+ long-running session) never
+        // turns a tab-open into a minute of IO. Recent sessions carry the
+        // overwhelming majority of volume, so the time-of-day shape is intact.
+        let codexRoots = [home.appendingPathComponent(".codex/sessions"),
+                          home.appendingPathComponent(".codex/archived_sessions")]
+        for file in jsonlFiles(under: codexRoots, modifiedAfter: fileCutoff, limit: 450) {
+            for line in lines(of: file, maxBytes: 1_500_000) {
+                guard line.contains("token_count"),
+                      let object = jsonLine(line),
+                      let payload = object["payload"] as? [String: Any],
+                      (payload["type"] as? String) == "token_count",
+                      let ts = parseDate(object["timestamp"]) else { continue }
+                let info = payload["info"] as? [String: Any]
+                let last = info?["last_token_usage"] as? [String: Any]
+                bucket(ts, into: &codex, tokens: anyInt(last?["total_tokens"]))
+            }
+        }
+
+        // Claude: per-message usage, deduped by message id.
+        if includeClaude {
+            var seen = Set<String>()
+            let claudeRoot = home.appendingPathComponent(".claude/projects")
+            for file in jsonlFiles(under: [claudeRoot], modifiedAfter: fileCutoff, limit: 200) {
+                for line in lines(of: file, maxBytes: 1_500_000) {
+                    guard line.contains("\"usage\""),
+                          let object = jsonLine(line),
+                          (object["type"] as? String) == "assistant",
+                          let message = object["message"] as? [String: Any],
+                          let usage = message["usage"] as? [String: Any],
+                          let id = message["id"] as? String,
+                          let ts = parseDate(object["timestamp"]) else { continue }
+                    if !seen.insert(id).inserted { continue }
+                    let total = anyInt(usage["input_tokens"]) + anyInt(usage["output_tokens"])
+                        + anyInt(usage["cache_creation_input_tokens"]) + anyInt(usage["cache_read_input_tokens"])
+                    bucket(ts, into: &claude, tokens: total)
+                }
+            }
+        }
+
+        let result = HourlyUsage(codex: codex, claude: claude, days: days, lastUpdated: now)
+        cacheLock.lock(); cache = result; cacheLock.unlock()
+        return result
+    }
+
+    private static func jsonlFiles(under roots: [URL], modifiedAfter cutoff: Date, limit: Int) -> [URL] {
+        let fm = FileManager.default
+        var candidates: [(url: URL, modified: Date)] = []
+        for root in roots {
+            guard let walker = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            for case let url as URL in walker {
+                guard url.pathExtension == "jsonl" else { continue }
+                let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                if modified < cutoff { continue }
+                candidates.append((url, modified))
+            }
+        }
+        return candidates.sorted { $0.modified > $1.modified }.prefix(limit).map(\.url)
+    }
+
+    // Read at most `maxBytes` from the head of a file and return whole lines.
+    // Caps the cost of pathologically large session rollouts (a live session
+    // can grow past 200MB) without slurping the whole file into memory.
+    private static func lines(of file: URL, maxBytes: Int) -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return [] }
+        defer { try? handle.close() }
+        let data = (try? handle.read(upToCount: maxBytes)) ?? Data()
+        if data.isEmpty { return [] }
+        var text = String(decoding: data, as: UTF8.self)
+        // If we stopped at the byte cap we probably cut a line in half; drop it.
+        if data.count >= maxBytes, let lastNewline = text.lastIndex(of: "\n") {
+            text = String(text[..<lastNewline])
+        }
+        return text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+    }
+
+    private static func jsonLine<S: StringProtocol>(_ line: S) -> [String: Any]? {
+        guard let data = String(line).data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private static func anyInt(_ value: Any?) -> Int {
+        if let i = value as? Int { return i }
+        if let n = value as? NSNumber { return n.intValue }
+        if let d = value as? Double { return Int(d) }
+        if let s = value as? String { return Int(s) ?? 0 }
+        return 0
+    }
+}
+
+enum HourlyFormat {
+    static func tokens(_ value: Int) -> String {
+        let v = Double(value)
+        if v >= 1e9 { return String(format: "%.1fB", v / 1e9) }
+        if v >= 1e6 { return String(format: "%.0fM", v / 1e6) }
+        if v >= 1e3 { return String(format: "%.0fk", v / 1e3) }
+        return "\(value)"
+    }
+}
+
+struct HourlyUsageView: View {
+    let includeClaude: Bool
+    let days: Int
+    let preloaded: HourlyUsage?
+    @State private var usage: HourlyUsage
+    @State private var loading: Bool
+
+    init(includeClaude: Bool, days: Int = 14, preloaded: HourlyUsage? = nil) {
+        self.includeClaude = includeClaude
+        self.days = days
+        self.preloaded = preloaded
+        _usage = State(initialValue: preloaded ?? .empty)
+        _loading = State(initialValue: preloaded == nil)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            header
+            chart
+            footer
+            Text("History older than a couple of weeks is compressed out of the live logs, so only the last ~2 weeks show here.")
+                .font(.caption2)
+                .foregroundStyle(PaceTheme.muted.opacity(0.8))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+        .task(id: days) { if preloaded == nil { await reload() } }
+    }
+
+    private func reload() async {
+        loading = true
+        let snapshot = await Task.detached(priority: .utility) {
+            HourlyUsageReader.load(days: days, includeClaude: includeClaude)
+        }.value
+        usage = snapshot
+        loading = false
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("When you burn tokens")
+                .font(.system(size: 15, weight: .semibold))
+            Text("by hour of day · last \(usage.days == 0 ? days : usage.days) days · local time")
+                .font(.caption)
+                .foregroundStyle(PaceTheme.muted)
+        }
+    }
+
+    private var maxHour: Double { Double(max(1, usage.hourTotals.max() ?? 1)) }
+
+    private var chart: some View {
+        VStack(spacing: 6) {
+            HStack(alignment: .bottom, spacing: 3) {
+                ForEach(0..<24, id: \.self) { hour in bar(for: hour) }
+            }
+            .frame(height: 150)
+            HStack(spacing: 3) {
+                ForEach(0..<24, id: \.self) { hour in
+                    Text(hour % 6 == 0 ? String(format: "%02d", hour) : "")
+                        .font(.system(size: 8))
+                        .foregroundStyle(PaceTheme.muted)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity)
+        .background(PaceTheme.card, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(PaceTheme.stroke))
+        .overlay {
+            if loading {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading session history…")
+                        .font(.caption)
+                        .foregroundStyle(PaceTheme.muted)
+                }
+            }
+        }
+        .opacity(loading ? 0.55 : 1)
+        .animation(.easeOut(duration: 0.25), value: loading)
+    }
+
+    private func bar(for hour: Int) -> some View {
+        let codexHeight = 150 * Double(usage.codex[hour]) / maxHour
+        let claudeHeight = 150 * Double(usage.claude[hour]) / maxHour
+        let isPeak = usage.peakHour == hour
+        return VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            RoundedRectangle(cornerRadius: 2).fill(PaceTheme.amber)
+                .frame(height: max(0, claudeHeight))
+            RoundedRectangle(cornerRadius: 2)
+                .fill(isPeak ? PaceTheme.teal : PaceTheme.teal.opacity(0.7))
+                .frame(height: max(usage.codex[hour] > 0 ? 2 : 0, codexHeight))
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var footer: some View {
+        HStack(alignment: .top, spacing: 16) {
+            if let peak = usage.peakHour {
+                stat("Peak hour", String(format: "%02d:00", peak), PaceTheme.teal)
+            }
+            if let window = usage.peakWindow {
+                stat("Busiest 3h",
+                     String(format: "%02d–%02d · %.0f%%", window.start, (window.start + 3) % 24, window.share * 100),
+                     .white)
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 3) {
+                legend(PaceTheme.teal, "Codex")
+                if includeClaude { legend(PaceTheme.amber, "Claude") }
+            }
+        }
+    }
+
+    private func stat(_ title: String, _ value: String, _ color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.system(size: 10)).foregroundStyle(PaceTheme.muted).textCase(.uppercase)
+            Text(value).font(.system(size: 16, weight: .semibold, design: .rounded)).foregroundStyle(color)
+        }
+    }
+
+    private func legend(_ color: Color, _ text: String) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            Text(text).font(.caption2).foregroundStyle(PaceTheme.muted)
+        }
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusController: StatusBarController?
@@ -3664,9 +4233,72 @@ func shell(_ command: String) -> String {
 }
 
 let args = CommandLine.arguments
+if args.contains("--sesh-proof") {
+    print(SeshMeasurement.readRendered())
+    exit(0)
+}
+if args.contains("--self-test-sesh-proof") {
+    let passed = SeshMeasurement.selfTest()
+    print(passed ? "sesh_proof_self_test=pass" : "sesh_proof_self_test=fail")
+    exit(passed ? 0 : 10)
+}
+if args.contains("--self-test-sesh-control") {
+    let passed = SeshControlBackend.selfTest()
+    print(passed ? "sesh_control_self_test=pass" : "sesh_control_self_test=fail")
+    exit(passed ? 0 : 11)
+}
+if args.contains("--self-test-sesh-benchmark") {
+    let passed = SeshSlowAutoBenchmark.selfTest()
+    print(passed ? "sesh_benchmark_self_test=pass" : "sesh_benchmark_self_test=fail")
+    exit(passed ? 0 : 12)
+}
 if args.contains("--dump-summary") {
     print(PaceSnapshot.collect(refreshFeeds: true).dumpText)
     exit(0)
+}
+if args.contains("--self-test-window-mapping") {
+    func fixture(_ used: Double, _ minutes: Double? = nil) -> [String: Any] {
+        var out: [String: Any] = ["used_percent": used, "resets_at": 1_900_000_000]
+        if let minutes { out["window_minutes"] = minutes }
+        return out
+    }
+    func minutes(_ window: [String: Any]?) -> Int? {
+        number(window?["window_minutes"]).map { Int($0) }
+    }
+    let historical = QuotaWindowClassifier.canonical(
+        primary: fixture(20, 300),
+        secondary: fixture(40, 10_080)
+    )
+    let weeklyOnly = QuotaWindowClassifier.canonical(
+        primary: fixture(7, 10_080),
+        secondary: nil
+    )
+    let reversed = QuotaWindowClassifier.canonical(
+        primary: fixture(7, 10_080),
+        secondary: fixture(20, 300)
+    )
+    var weeklySnapshot = PaceSnapshot()
+    weeklySnapshot.quotas = [
+        QuotaReading(
+            engine: "Codex",
+            window: "week",
+            usedPercent: 7,
+            resetAt: Date().addingTimeInterval(6 * 86_400),
+            source: "fixture",
+            updatedAt: Date(),
+            windowMinutes: 10_080
+        )
+    ]
+    let title = StatusBarText.codexTitleParts(for: weeklySnapshot)?.percentText
+    let passed = minutes(historical.fiveHour) == 300
+        && minutes(historical.weekly) == 10_080
+        && weeklyOnly.fiveHour == nil
+        && minutes(weeklyOnly.weekly) == 10_080
+        && minutes(reversed.fiveHour) == 300
+        && minutes(reversed.weekly) == 10_080
+        && title == "93% wk"
+    print(passed ? "window_mapping=pass headline=\(title ?? "missing")" : "window_mapping=fail headline=\(title ?? "missing")")
+    exit(passed ? 0 : 8)
 }
 struct BarMockView: View {
     let levels: [Double]
@@ -3707,6 +4339,7 @@ if let flagIndex = args.firstIndex(of: "--screenshot"), args.count > flagIndex +
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let store = PaceStore()
     store.snapshot = PaceSnapshot.collect(refreshFeeds: true)
+    store.seshControl.refreshSynchronouslyForScreenshot()
 
     func writePNG<Content: View>(_ view: Content, name: String) {
         let renderer = ImageRenderer(content: view)
@@ -3720,7 +4353,7 @@ if let flagIndex = args.firstIndex(of: "--screenshot"), args.count > flagIndex +
 
     writePNG(PacePanelView(store: store).screenshotBody.fixedSize(horizontal: false, vertical: true), name: "popover.png")
     writePNG(
-        BarMockView(levels: [0.35, 0.7, 1.0], percent: "62%", detail: "38m", urgent: true, color: Color(nsColor: .systemOrange))
+        BarMockView(levels: [0.35, 0.7, 1.0], percent: "90% wk", detail: "", urgent: false, color: Color(nsColor: .labelColor))
             .padding(8).background(Color(white: 0.16)),
         name: "menubar.png"
     )
@@ -3731,6 +4364,33 @@ if args.contains("--native-poll") {
     // regardless of any external poller scripts on this machine.
     NativeUsagePoller.poll()
     print((try? String(contentsOf: PaceFeedPaths.nativeCodexFeed, encoding: .utf8)) ?? "no native feed written")
+    exit(0)
+}
+
+if args.contains("--hours") {
+    // Diagnostic: exercise the hour-of-day reader headlessly and render a
+    // preview PNG, so the "Hours" tab can be verified without a GUI session.
+    let usage = HourlyUsageReader.load(days: 14, includeClaude: true)
+    var out = "hours last=\(usage.days)d peak=\(usage.peakHour.map { String(format: "%02d:00", $0) } ?? "-") total=\(HourlyFormat.tokens(usage.total))\n"
+    for hour in 0..<24 {
+        out += String(format: "  %02d  codex=%-6@ claude=%-6@\n", hour,
+                      HourlyFormat.tokens(usage.codex[hour]) as NSString,
+                      HourlyFormat.tokens(usage.claude[hour]) as NSString)
+    }
+    print(out)
+    let renderer = ImageRenderer(content:
+        HourlyUsageView(includeClaude: true, preloaded: usage)
+            .frame(width: 480)
+            .background(PaceTheme.panel)
+            .foregroundStyle(.white))
+    renderer.scale = 2
+    if let image = renderer.nsImage, let tiff = image.tiffRepresentation,
+       let rep = NSBitmapImageRep(data: tiff),
+       let png = rep.representation(using: .png, properties: [:]) {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("pace-hours.png")
+        try? png.write(to: url)
+        print("wrote \(url.path)")
+    }
     exit(0)
 }
 

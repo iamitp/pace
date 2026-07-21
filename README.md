@@ -24,6 +24,8 @@ It also reads the wire-level rate limits that actually gate the Codex engine - t
 - 5-hour and weekly quota pools, including multiple weekly pools
 - Banked reset credits with expiry dates and full redeemed/expired history
 - Recent sessions from local Codex CLI logs
+- Read-only Sesh automatic instrument cluster for route, urgency, worker, token,
+  and verification evidence
 
 ## How It Works / Privacy
 
@@ -33,6 +35,69 @@ Pace reads from:
 - `~/.codex/auth.json` (your local Codex credential file)
 
 Pace calls only OpenAI's own usage endpoints, authenticated with your existing token. It makes no third-party calls, stores no telemetry, and sends nothing off the Mac. Session history, burn rates, and the reset ledger are computed and stored locally.
+
+### Sesh evidence bridge
+
+Pace and Sesh are integrated, but their responsibilities stay separate. Sesh is
+the automatic transmission. Pace is the instrument cluster. Pace never chooses
+a model, effort, speed tier, topology, worker count, or verification depth.
+
+Local builds can independently aggregate Sesh's private sanitized decision log:
+
+```bash
+.build/debug/Headroom --sesh-proof
+```
+
+The bridge is read-only. Schema-2 conductor telemetry reports verified runs,
+complete provider-thread and task-tree token coverage, provider turns, topology,
+workers, routes, escalations, latency, and protected-floor violations. It never
+changes a live route and never displays raw prompts, responses, commands, paths,
+or provider thread identifiers.
+
+The authoritative local counter is provider-reported cumulative
+`tokenUsage.total`, aggregated across every provider thread in the measured task. Pace
+does not label tokens as credits or quota savings because no authoritative
+per-task local credit counter is available.
+
+The corrected nine-session Slow/Auto experiment remains visible only as a
+failed retired single-route baseline. Its 9 of 9 quality result does not rescue
+the product verdict: the worst Slow task used 30.8 percent more tokens, Auto's
+uncached tokens were 20.7 percent higher, and cache sensitivity failed. Its Fast
+comparison was a derived 2.5x proxy, not an observed Fast run, credits, or
+quota. It does not calibrate the new conductor.
+
+### Managed sessions
+
+Sesh is always on for ordinary Codex New Tasks through the global conductor
+contract and pinned worker profiles. There is no mode selector to remember.
+
+For full workspace-scoped lifecycle and complete task-tree measurement, Pace
+also opens Sesh-managed Codex tasks:
+
+1. Choose one scoped project folder.
+2. Use **Start Managed Task** or **Resume Managed Task** for that project's
+   saved Sesh conversation.
+3. Use **New Managed Task** only when a fresh provider conversation is wanted
+   and the saved managed context should not be resumed.
+
+Sesh classifies the task locally, then starts exactly one direct provider role.
+One-file mechanical edits and uncertain read-only discovery use Terra Low,
+ordinary bounded implementation uses Terra Medium, and protected tasks or a
+trusted quality-failure escalation use Sol Ultra. OpenAI Standard
+is the default service tier. Fast is eligible only when the task itself
+expresses immediate urgency and fresh complete capacity evidence supports it.
+
+A native New Task receives the automatic policy and works directly on the model
+already selected by Codex. A managed task lets Sesh select the economical direct
+model before launch and adds the complete measurement boundary. It is not a
+different driving mode.
+
+The Sesh controller is embedded inside `Pace.app`; no separate Sesh menu-bar app
+is required. The local installer also keeps `~/bin/sesh` as a command-line entry
+point into the bundled controller while preserving `~/.config/sesh` state. It
+also installs one owned Sesh block into `~/.codex/AGENTS.md` and three pinned
+worker profiles without replacing unrelated Codex instructions or agents. The
+unified local package is Pace 1.3.0 build 130 and bundles Sesh 4.2.0.
 
 ## Install
 

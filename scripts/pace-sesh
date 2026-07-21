@@ -1,0 +1,24 @@
+#!/bin/zsh
+# PACE_MANAGED_SESH_V1
+
+set -euo pipefail
+
+script_directory="${0:A:h}"
+bundled_controller="$script_directory/sesh.py"
+installed_controller="/Applications/Pace.app/Contents/Resources/Sesh/sesh.py"
+pinned_codex_directory="$HOME/.codex/packages/standalone/releases/0.144.3-aarch64-apple-darwin/bin"
+
+if [[ -x "$pinned_codex_directory/codex" && ! -L "$pinned_codex_directory/codex" ]]; then
+  export PATH="$pinned_codex_directory:$PATH"
+fi
+
+if [[ -r "$bundled_controller" && ! -L "$bundled_controller" ]]; then
+  exec /usr/bin/python3 "$bundled_controller" "$@"
+fi
+
+if [[ -r "$installed_controller" && ! -L "$installed_controller" ]]; then
+  exec /usr/bin/python3 "$installed_controller" "$@"
+fi
+
+print -u2 -- "Pace: the bundled Sesh controller is unavailable. Reinstall Pace."
+exit 127
