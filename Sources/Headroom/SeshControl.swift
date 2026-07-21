@@ -305,7 +305,6 @@ struct SeshControlStatus: Decodable, Equatable, Sendable {
 
     fileprivate var isValid: Bool {
         guard schema == 3,
-              automatic,
               statePath.hasPrefix("/"),
               SeshStatusValidation.safeText(statePath, maximum: 4_096),
               conductor?.isValid != false,
@@ -835,6 +834,8 @@ final class SeshControlBackend: @unchecked Sendable {
                 return false
             } catch SeshControlError.invalidResponse {}
 
+            // Economy default OFF (`sesh off`) is a valid state the card must
+            // display, not an error. This mirrors the on/off toggle contract.
             let disabledBackend = SeshControlBackend(
                 homeURL: home,
                 configDirectoryURL: config,
@@ -851,10 +852,38 @@ final class SeshControlBackend: @unchecked Sendable {
                     )
                 }
             )
-            do {
-                _ = try disabledBackend.status(for: nil)
-                return false
-            } catch SeshControlError.invalidResponse {}
+            let disabledStatus = try disabledBackend.status(for: nil)
+            guard disabledStatus.automatic == false,
+                  disabledStatus.state == .idle,
+                  disabledStatus.conductor == nil,
+                  disabledStatus.latestRun == nil
+            else { return false }
+
+            // setEconomyMode issues the bare on/off subcommand, no cwd.
+            let toggleRecorder = Recorder()
+            let toggleBackend = SeshControlBackend(
+                homeURL: home,
+                configDirectoryURL: config,
+                cliURL: cli,
+                commandRunner: { executable, arguments, workingDirectory in
+                    guard executable == cli, workingDirectory == nil else {
+                        return SeshControlCommandOutput(
+                            stdout: Data(),
+                            stderr: Data("unexpected invocation".utf8),
+                            terminationStatus: 9
+                        )
+                    }
+                    toggleRecorder.arguments.append(arguments)
+                    return SeshControlCommandOutput(
+                        stdout: Data("ok".utf8),
+                        stderr: Data(),
+                        terminationStatus: 0
+                    )
+                }
+            )
+            try toggleBackend.setEconomyMode(on: true)
+            try toggleBackend.setEconomyMode(on: false)
+            guard toggleRecorder.arguments == [["on"], ["off"]] else { return false }
 
             var unsafeStatus = try JSONSerialization.jsonObject(with: statusJSON)
                 as? [String: Any] ?? [:]
@@ -1045,6 +1074,13 @@ final class SeshControlBackend: @unchecked Sendable {
             "auto-codex-\(digest.prefix(12)).json",
             isDirectory: false
         )
+    }
+
+    /// Flip the computer-wide economy default for new native Codex launches.
+    /// `on` writes the economy gear into ~/.codex/config.toml; `off` restores
+    /// the previously saved default. Running sessions are never re-geared.
+    func setEconomyMode(on: Bool) throws {
+        _ = try runCLI(arguments: [on ? "on" : "off"])
     }
 
     private func runCLI(arguments: [String]) throws -> SeshControlCommandOutput {

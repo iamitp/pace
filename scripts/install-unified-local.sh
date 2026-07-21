@@ -9,16 +9,16 @@ fail() {
 }
 
 root="${0:A:h:h}"
-source_app="${1:-$root/dist/Pace-1.4.0.app}"
+source_app="${1:-$root/dist/Pace-1.4.2.app}"
 destination="/Applications/Pace.app"
-incoming="/Applications/.Pace-1.4.0.incoming.app"
-failed="/Applications/Pace.app.failed-1.4.0"
+incoming="/Applications/.Pace-1.4.2.incoming.app"
+failed="/Applications/Pace.app.failed-1.4.2"
 expected_executable="$destination/Contents/MacOS/Headroom"
 sesh_destination="$HOME/bin/sesh"
 sesh_source="$source_app/Contents/Resources/Sesh/sesh"
 sesh_integration_source="$source_app/Contents/Resources/Sesh/integration"
 sesh_integration_installer_source="$source_app/Contents/Resources/Sesh/install-native-integration"
-sesh_staged="$HOME/bin/.pace-sesh-1.4.0.incoming"
+sesh_staged="$HOME/bin/.pace-sesh-1.4.2.incoming"
 sesh_backup="$HOME/bin/.pace-sesh.previous.$$"
 
 [[ -d "$source_app" && ! -L "$source_app" ]] || fail "the verified source app is unavailable."
@@ -29,8 +29,8 @@ sesh_backup="$HOME/bin/.pace-sesh.previous.$$"
 current_version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$destination/Contents/Info.plist")"
 backup="/Applications/Pace.app.rollback-$current_version"
 [[ ! -e "$backup" && ! -L "$backup" ]] || fail "the rollback destination already exists."
-[[ "$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$source_app/Contents/Info.plist")" == "1.4.0" ]] || fail "the replacement is not Pace 1.4.0."
-[[ "$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$source_app/Contents/Info.plist")" == "140" ]] || fail "the replacement is not build 140."
+[[ "$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$source_app/Contents/Info.plist")" == "1.4.2" ]] || fail "the replacement is not Pace 1.4.2."
+[[ "$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$source_app/Contents/Info.plist")" == "142" ]] || fail "the replacement is not build 142."
 [[ -f "$sesh_source" && -x "$sesh_source" && ! -L "$sesh_source" ]] || fail "the bundled Sesh controller is missing or unsafe."
 [[ -d "$sesh_integration_source" && ! -L "$sesh_integration_source" ]] || fail "the bundled native Sesh integration is missing or unsafe."
 [[ -f "$sesh_integration_installer_source" && -x "$sesh_integration_installer_source" && ! -L "$sesh_integration_installer_source" ]] || fail "the bundled native Sesh installer is missing or unsafe."
@@ -39,14 +39,14 @@ backup="/Applications/Pace.app.rollback-$current_version"
 cleanup_incoming() {
   if [[ -d "$incoming" ]]; then
     case "$incoming" in
-      /Applications/.Pace-1.4.0.incoming.app)
+      /Applications/.Pace-1.4.2.incoming.app)
         rm -rf "$incoming"
         ;;
     esac
   fi
   if [[ -f "$sesh_staged" && ! -L "$sesh_staged" ]]; then
     case "$sesh_staged" in
-      "$HOME/bin/.pace-sesh-1.4.0.incoming")
+      "$HOME/bin/.pace-sesh-1.4.2.incoming")
         rm -f "$sesh_staged"
         ;;
     esac
@@ -120,7 +120,7 @@ installed_integration_source="$destination/Contents/Resources/Sesh/integration"
 if ! "$installed_integration_installer" "$installed_integration_source"; then
   rm -f "$sesh_destination"
   [[ ! -e "$sesh_backup" ]] || mv "$sesh_backup" "$sesh_destination"
-  mv "$destination" "/Applications/Pace.app.failed-1.4.0"
+  mv "$destination" "/Applications/Pace.app.failed-1.4.2"
   mv "$backup" "$destination"
   fail "native Codex integration failed; Pace $current_version was restored."
 fi
@@ -133,7 +133,7 @@ for _ in {1..20}; do
   [[ -n "$new_pid" ]] && break
   /bin/sleep 0.25
 done
-[[ -n "$new_pid" ]] || fail "Pace 1.4.0 was installed but did not start. The rollback app remains available."
+[[ -n "$new_pid" ]] || fail "Pace 1.4.2 was installed but did not start. The rollback app remains available."
 
 print -- "install=pass"
 print -- "installed_app=$destination"

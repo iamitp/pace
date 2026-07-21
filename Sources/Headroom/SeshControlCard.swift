@@ -209,6 +209,33 @@ final class SeshControlController: ObservableObject {
         }
     }
 
+    var economyOn: Bool { status?.automatic ?? true }
+
+    func setEconomy(_ on: Bool) {
+        guard !isActing else { return }
+        let workspace = selection?.url
+        isActing = true
+        errorMessage = nil
+        notice = nil
+
+        Task { [backend] in
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try backend.setEconomyMode(on: on)
+                }.value
+                self.status = try await Task.detached(priority: .userInitiated) {
+                    try backend.status(for: workspace)
+                }.value
+                self.notice = on
+                    ? "Economy default on. New native Codex chats start on Terra Medium."
+                    : "Economy default off. Your previous native default is restored."
+            } catch {
+                self.errorMessage = Self.safeMessage(error)
+            }
+            self.isActing = false
+        }
+    }
+
     private func apply(_ payload: SeshControlRefreshPayload) {
         status = payload.status
         selection = payload.selection
@@ -384,6 +411,35 @@ struct SeshControlCard: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(PaceTheme.muted)
                 .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+                .padding(.vertical, 2)
+
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: "bolt.horizontal.circle")
+                    .foregroundStyle(controller.economyOn ? PaceTheme.teal : PaceTheme.muted)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Economy default")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("New native Codex chats start on Terra Medium. Running sessions and Pace-managed tasks are unaffected.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(PaceTheme.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Button {
+                    controller.setEconomy(!controller.economyOn)
+                } label: {
+                    Text(controller.economyOn ? "ON" : "OFF")
+                        .font(.system(size: 10.5, weight: .bold))
+                        .frame(minWidth: 34)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(controller.economyOn ? PaceTheme.teal : PaceTheme.muted)
+                .disabled(controller.isActing)
+                .accessibilityIdentifier("sesh-economy-toggle")
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
